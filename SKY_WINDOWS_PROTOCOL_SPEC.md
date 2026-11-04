@@ -396,6 +396,20 @@ Semantics:
 * Screenshots are emitted as a side effect after a successful call: `nodeRepl.emitImage(url)` else `codex.emitImage({type:"input_image", image_url:url, detail:"original"})`, both optional — **no-op in plain Node**, so you must surface `result.screenshots[].url` yourself.
 * Images are JPEG: `image/jpeg`, `BitmapEncoder.CreateAsync`, `ImageQuality` (`@0x1282179`).
 
+### D.1 Golden — live A/B measurements against the original helper (2026-11)
+
+* **Engine architecture (PE analysis).** `bin\windows\codex-computer-use.exe` (1.5 MB) is a launcher stub with an **empty import table**; the real engine is `bin\windows\swift\x64\codex-computer-use-swift.exe` (~55 MB, MSVC toolchain — pulls `MSVCP140.dll`, `VCRUNTIME140*.dll`, sha256-pinned in `manifest.json`). The stub relays the stdio JSON-RPC contract to the swift engine.
+* **Result top level** (measured, text-only mode): `{ "window": {app,id,title}, "screenshots": [], "accessibility": {…}, "cacheDiagnostics": {…} }`. `window` carries **no** `displayName`. `screenshots` is always present (`[]` when `include_screenshot:false` or capture failed — capture failure is silent in text mode). `accessibility` is omitted when `include_text:false`.
+* **Check order (measured on a minimized window):** serde parse → window resolution (pid/app/owner) → **approval** → **both-false include check** → **minimized refusal**. A first-touch unapproved minimized window yields `approvalRequest`, not the minimized error.
+* **Tree format (277-line golden vs a 278-line original capture, byte-exact on shared nodes):**
+  `Window: "{title}", App: {exe-file-name}.` header, then one line per node: `"\t".repeat(depth+1) + "{index} {LocalizedControlType}"` plus optional suffixes **in this order**: `" (disabled)"`, `" (settable, string)"`, `" {name}"`, `" Description: {helpText}"`, `" Value: {value}"`, `" ID: {automationId}"`, and `" Secondary Actions: Raise"` **only on the window root**.
+* `focused_element` is **the focused node's own tree line** (same index), not a separately formatted record.
+* `document_text` = the `ValuePattern` value of the **last** `Document` node in the walk.
+* `cacheDiagnostics`: `{accessibilityRevision, accessibilitySnapshotCount, captureCachedSessionCount}`; a freshly built tree bumps revision **+1** and snapshot count **+3**; a second call on an unchanged window (same title/origin/size) replays the cache with no bump.
+* `diagnostic_state` result: `{ "cacheDiagnostics": {…}, "lastWindowIdentity": null | {appId, bounds:{originX,originY,width,height}, inputHwnd:"985200" (STRING), processId:47444 (int), processName:"App.exe", rootHwnd:"985200" (STRING), snapshotRevision, title} }`. `bounds` are **DPI-physical** pixels — the helper process is per-monitor-v2 DPI aware.
+* **Suspended providers:** plain UIA walker calls see only the top 3–4 nodes of a provider suspended by the lock screen, while the original renders the full 277-node tree from the same spawn context. Live UIA event subscriptions (`AddStructureChangedEventHandler` on the window root, `TreeScope_Subtree`) make the UIA core bring provider connections up; our engine does exactly that before walking (`wake_provider`).
+* **Wire deviation accepted:** `approvalRequest` JSON field **order** differs (original emits struct-definition order `app,displayName,riskLevel,allowPersistentApproval`; ours is alphabetical). JSON-semantically identical; every JSON.parse consumer is unaffected.
+
 ---
 
 ## E. INTERRUPT / ESC / TURN LIFECYCLE

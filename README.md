@@ -80,6 +80,8 @@ helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
 ## 已知限制（实测）
 
 - 部分现代应用不向助手暴露完整 UIA 树（视窗口状态而定）→ 用截图 + 坐标/键盘驱动。
+- 进程被系统挂起时（锁屏会话），UIA provider 连接可能只回顶层节点；引擎已按原版行为做 structure-changed 事件订阅唤醒（`wake_provider`），极端场景下树覆盖仍可能少于原版——解锁后进程恢复即正常。
+- 已知线级偏差：`approvalRequest` 的 JSON 字段顺序与原版不同（字母序 vs 结构定义序），JSON 语义等价，对所有解析方透明。
 - `explorer.exe` 等共享系统进程的窗口报 `executable has multiple signatures`，无法寻址。
 - 锁屏会话期间截图返回权限错误并降级为无截图（与原版行为一致）。
 - 遮挡检测是尽力而为：只有当快照同时捕获到覆盖窗口时才能判定；输入前务必先 `sky__activate_window`。
