@@ -1,11 +1,16 @@
-// UI Automation tree construction for get_window_state. Uses the control
-// view walker with a property cache request so each node costs one round
-// trip. The returned element records back the element_index used by
-// click_element / set_value / perform_secondary_action.
+// UI Automation tree construction for get_window_state. The original helper
+// renders the control-view tree as an indented text document:
+//
+//   Window: "{title}", App: {exe}.
+//   \t{idx} {LocalizedControlType} [(disabled)] [(settable, string)] [{name}]
+//       [ Description: …] [ Value: …] [ ID: …] [ Secondary Actions: Raise]
+//
+// with a global element index feeding element_index actions, the focused
+// node echoed as its own tree line, and document_text from the last
+// Document node's ValuePattern.
 
-use serde_json::{json, Value};
 use uiautomation::core::{UIAutomation, UIElement};
-use uiautomation::types::UIProperty;
+use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
 use windows::Win32::Foundation::HWND;
 
 /// One row of the flattened snapshot tree, kept for element_index actions.
@@ -24,16 +29,18 @@ pub struct ElementRecord {
 }
 
 pub struct BuiltTree {
-    /// Indented text rendering with element indexes.
+    /// Rendered tree (header line + one tab-indented line per node).
     pub tree: String,
-    /// Elements in index order (index == position in this vec).
+    /// Elements in index order (index == position in this vec == tree idx).
     pub elements: Vec<ElementRecord>,
-    /// Focused element descriptor, if any.
-    pub focused: Option<Value>,
+    /// Focused element rendered as its tree line (index matches the tree).
+    pub focused_element: Option<String>,
+    /// Text of the last Document node's value (browser page text).
+    pub document_text: Option<String>,
 }
 
 const MAX_ELEMENTS: usize = 600;
-const MAX_DEPTH: usize = 32;
+const MAX_DEPTH: usize = 64;
 const TREE_BUDGET_MS: u128 = 6500;
 
 fn now_ms() -> u64 {
@@ -50,80 +57,155 @@ fn dbg_log(msg: &str) {
     let path = crate::win::taskbar::tmp_dir().join("dsh-sky-uia-debug.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         use std::io::Write;
-        let _ = writeln!(f, "{}", msg);
+        let _ = writeln!(f, "{msg}");
     }
 }
 
-fn cache_request(uia: &UIAutomation) -> uiautomation::Result<uiautomation::core::UICacheRequest> {
-    let req = uia.create_cache_request()?;
-    for p in [
-        UIProperty::Name,
-        UIProperty::ControlType,
-        UIProperty::BoundingRectangle,
-        UIProperty::IsOffscreen,
-        UIProperty::IsEnabled,
-    ] {
-        let _ = req.add_property(p);
-    }
-    // Patterns element actions need at click/set_value/secondary time.
-    use uiautomation::patterns::UIPatternType;
-    for p in [
-        UIPatternType::Value,
-        UIPatternType::ExpandCollapse,
-        UIPatternType::Scroll,
-        UIPatternType::Invoke,
-        UIPatternType::Window,
-        UIPatternType::Transform,
-    ] {
-        let _ = req.add_pattern(p);
-    }
-    Ok(req)
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
-/// Build the accessibility tree for `hwnd`.
-pub fn build_tree(hwnd: HWND) -> Result<BuiltTree, String> {
+// Wake a potentially suspended UIA provider: subscribing a live
+// structure-changed event handler forces the UIA core to bring the
+// provider connection up, after which even a suspended Chromium exposes
+// its full subtree (matches the original helper's observed behaviour).
+#[allow(non_camel_case_types)]
+mod uia_bindings {
+    use windows::core::{implement, Ref as WinRef, Result as WinResult};
+    use windows::Win32::System::Com::SAFEARRAY;
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationElement, IUIAutomationStructureChangedEventHandler,
+        IUIAutomationStructureChangedEventHandler_Impl, StructureChangeType,
+    };
+
+    #[derive(Default)]
+    #[implement(IUIAutomationStructureChangedEventHandler)]
+    pub struct NopStructureHandler;
+
+    impl IUIAutomationStructureChangedEventHandler_Impl for NopStructureHandler_Impl {
+        fn HandleStructureChangedEvent(
+            &self,
+            _sender: WinRef<'_, IUIAutomationElement>,
+            _changetype: StructureChangeType,
+            _runtimeid: *const SAFEARRAY,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+    }
+
+    pub use windows::Win32::UI::Accessibility::IUIAutomationStructureChangedEventHandler as HandlerIfc;
+
+    /// The UIA core keeps calling into the handler from its own threads;
+    /// we only ever park strong references, which is Send-safe across the
+    /// MTA process.
+    pub struct Keepalive(#[allow(dead_code)] pub HandlerIfc);
+    // SAFETY: interface pointer to an apartment-agnostic COM object.
+    unsafe impl Send for Keepalive {}
+}
+
+fn wake_provider(hwnd: HWND) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    use uia_bindings::{Keepalive, NopStructureHandler};
+    static KEEP: OnceLock<Mutex<(HashSet<isize>, Vec<Keepalive>)>> = OnceLock::new();
+    let keep = KEEP.get_or_init(|| Mutex::new((HashSet::new(), Vec::new())));
+    if let Ok(g) = keep.lock() {
+        if g.0.contains(&(hwnd.0 as isize)) {
+            return; // already subscribed for this window
+        }
+    }
+    unsafe {
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Accessibility::{
+            CUIAutomation, IUIAutomation, IUIAutomationStructureChangedEventHandler,
+            TreeScope_Subtree,
+        };
+        let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) else {
+            return;
+        };
+        let Ok(root) = uia.ElementFromHandle(hwnd) else {
+            return;
+        };
+        let handler: IUIAutomationStructureChangedEventHandler = NopStructureHandler.into();
+        match uia.AddStructureChangedEventHandler(&root, TreeScope_Subtree, None, &handler) {
+            Ok(()) => {
+                if let Ok(mut g) = keep.lock() {
+                    g.0.insert(hwnd.0 as isize);
+                    g.1.push(Keepalive(handler));
+                }
+                // Give the UIA core a beat to bring the provider up.
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => dbg_log(&format!("[wake-fail] hwnd={hwnd:?} {e}")),
+        }
+    }
+}
+
+/// Build the accessibility tree for `hwnd`. `app_name` renders the header
+/// line (`Window: "{title}", App: {app_name}.`).
+///
+/// Deliberately uses the non-cached walker/property calls: UIA's
+/// BuildCache variants ask the provider to answer live and yield an empty
+/// subtree for hung/suspended providers, while the plain calls let the UIA
+/// core replay its last known snapshot — which is what the original does
+/// (it renders full trees even for suspended Chromium processes).
+pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
+    wake_provider(hwnd);
     let uia = UIAutomation::new().map_err(|e| {
         dbg_log(&format!("[init-fail] {e}"));
         format!("uia init: {e}")
     })?;
-    let req = cache_request(&uia).map_err(|e| format!("cache req: {e}"))?;
     let root = uia
-        .element_from_handle_build_cache(
-            uiautomation::types::Handle::from(hwnd.0 as isize),
-            &req,
-        )
+        .element_from_handle(uiautomation::types::Handle::from(hwnd.0 as isize))
         .map_err(|e| {
             dbg_log(&format!("[from-handle-fail] hwnd={hwnd:?} {e}"));
             format!("element from handle: {e}")
         })?;
     let walker = uia
-        .get_control_view_walker()
+        .get_raw_view_walker()
         .map_err(|e| format!("walker: {e}"))?;
 
     let started = now_ms();
     let mut elements: Vec<ElementRecord> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
+    let mut last_document: Option<String> = None;
 
     walk(
         &walker,
-        &req,
         &root,
         0,
         started,
         &mut elements,
         &mut lines,
+        &mut last_document,
     );
 
-    // Focused element descriptor (best effort).
-    let focused = uia
-        .get_focused_element_build_cache(&req)
-        .ok()
-        .map(|el| describe(&el));
+    // Header line: title from the root element's Name.
+    let title = one_line(&root.get_name().unwrap_or_default());
+    let mut out_lines = vec![format!("Window: \"{title}\", App: {app_name}.")];
+    out_lines.append(&mut lines);
+    let tree = out_lines.join("\n");
+
+    // Focused element: rendered as its tree line when inside this subtree.
+    let focused_element = uia.get_focused_element().ok().and_then(|f| {
+        let fid = f.get_runtime_id().ok()?;
+        elements.iter().position(|r| {
+            r.element
+                .get_runtime_id()
+                .map(|id| id == fid)
+                .unwrap_or(false)
+        })
+    }).and_then(|i| out_lines.get(i + 1).cloned()); // +1: skip header line
 
     let built = BuiltTree {
-        tree: lines.join("\n"),
+        tree,
         elements,
-        focused,
+        focused_element,
+        document_text: last_document,
     };
     dbg_log(&format!(
         "[ok] hwnd={hwnd:?} elements={} tree_len={} ms={}",
@@ -133,23 +215,16 @@ pub fn build_tree(hwnd: HWND) -> Result<BuiltTree, String> {
     ));
     Ok(built)
 }
-fn describe(el: &UIElement) -> Value {
-    let name = el.get_name().unwrap_or_default();
-    let ct = el
-        .get_control_type()
-        .map(|c| format!("{c:?}"))
-        .unwrap_or_default();
-    json!({ "name": name, "controlType": ct })
-}
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     walker: &uiautomation::core::UITreeWalker,
-    req: &uiautomation::core::UICacheRequest,
     node: &UIElement,
     depth: usize,
     started: u64,
     elements: &mut Vec<ElementRecord>,
     lines: &mut Vec<String>,
+    last_document: &mut Option<String>,
 ) {
     if elements.len() >= MAX_ELEMENTS || depth > MAX_DEPTH {
         return;
@@ -158,11 +233,14 @@ fn walk(
         return;
     }
 
-    let name = node.get_name().unwrap_or_default();
+    let name = one_line(&node.get_name().unwrap_or_default());
     let control_type = node
         .get_control_type()
         .map(|c| format!("{c:?}"))
         .unwrap_or_else(|_| "Unknown".into());
+    let localized = node
+        .get_localized_control_type()
+        .unwrap_or_else(|_| control_type.clone());
     let rect = node
         .get_bounding_rectangle()
         .map(|r| (r.get_left(), r.get_top(), r.get_width(), r.get_height()))
@@ -170,11 +248,34 @@ fn walk(
     let offscreen = node.is_offscreen().unwrap_or(false);
     let enabled = node.is_enabled().unwrap_or(true);
 
-    // Skip invisible leaves; keep containers so their visible children
-    // still attach to a sensible parent.
-    let empty_rect = rect.2 <= 0 || rect.3 <= 0;
-    if offscreen && empty_rect {
-        return;
+    // ValuePattern shape: value string + settable marker.
+    let value = node
+        .get_pattern::<UIValuePattern>()
+        .ok()
+        .and_then(|p| p.get_value().ok())
+        .map(|v| one_line(&v))
+        .filter(|v| !v.is_empty());
+    let settable = node
+        .get_pattern::<UIValuePattern>()
+        .ok()
+        .and_then(|p| p.is_readonly().ok())
+        .map(|ro| !ro)
+        .unwrap_or(false);
+    let description = node
+        .get_pattern::<UILegacyIAccessiblePattern>()
+        .ok()
+        .and_then(|p| p.get_help().ok())
+        .map(|v| one_line(&v))
+        .filter(|v| !v.is_empty());
+    let automation_id = node
+        .get_automation_id()
+        .map(|v| one_line(&v))
+        .unwrap_or_default();
+
+    if control_type == "Document" {
+        if let Some(v) = &value {
+            *last_document = Some(v.clone());
+        }
     }
 
     let index = elements.len();
@@ -187,30 +288,52 @@ fn walk(
         enabled,
     });
 
-    let mut label = format!("{}[{}] {}", "  ".repeat(depth), index, control_type);
-    let trimmed = name.trim();
-    if !trimmed.is_empty() {
-        let shown: String = trimmed.chars().take(120).collect();
-        label.push_str(&format!(" {shown:?}"));
-    }
-    if rect != (0, 0, 0, 0) {
-        label.push_str(&format!(" ({},{},{},{})", rect.0, rect.1, rect.2, rect.3));
-    }
-    if offscreen {
-        label.push_str(" [offscreen]");
-    }
+    // Render per the original's field order.
+    let mut label = format!("{}{index} {localized}", "\t".repeat(depth + 1));
     if !enabled {
-        label.push_str(" [disabled]");
+        label.push_str(" (disabled)");
+    }
+    if settable {
+        label.push_str(" (settable, string)");
+    }
+    if !name.is_empty() {
+        label.push_str(&format!(" {name}"));
+    }
+    if let Some(d) = &description {
+        label.push_str(&format!(" Description: {d}"));
+    }
+    if let Some(v) = &value {
+        label.push_str(&format!(" Value: {v}"));
+    }
+    if !automation_id.is_empty() {
+        label.push_str(&format!(" ID: {automation_id}"));
+    }
+    if control_type == "Window" {
+        label.push_str(" Secondary Actions: Raise");
     }
     lines.push(label);
 
-    // Recurse through children.
-    let mut child = walker.get_first_child_build_cache(node, req).ok();
+    // Recurse through children (disabled/offscreen subtrees included: the
+    // original renders them). No children / provider gaps surface as Err
+    // (null + S_OK) and end the sibling walk, as before.
+    let mut child = match walker.get_first_child(node) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            dbg_log(&format!("[first-child-err] depth={depth} ct={control_type} {e}"));
+            None
+        }
+    };
     while let Some(c) = child {
-        walk(walker, req, &c, depth + 1, started, elements, lines);
+        walk(walker, &c, depth + 1, started, elements, lines, last_document);
         if elements.len() >= MAX_ELEMENTS || (now_ms() - started) as u128 > TREE_BUDGET_MS {
             break;
         }
-        child = walker.get_next_sibling_build_cache(&c, req).ok();
+        child = match walker.get_next_sibling(&c) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                dbg_log(&format!("[next-sib-err] depth={depth} {e}"));
+                None
+            }
+        };
     }
 }

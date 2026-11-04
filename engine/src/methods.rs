@@ -144,7 +144,9 @@ struct LaunchParams {
 struct Resolved {
     hwnd: HWND,
     origin: (i32, i32),
+    size: (i32, i32),
     owner: String,
+    pid: u32,
 }
 
 fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
@@ -186,7 +188,9 @@ fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
     Ok(Resolved {
         hwnd,
         origin: (rect.left, rect.top),
+        size: (rect.right - rect.left, rect.bottom - rect.top),
         owner,
+        pid,
     })
 }
 
@@ -235,6 +239,25 @@ fn canonical_approval_app(owner: &str) -> (String, String) {
                 .to_string()
         });
     (owner.to_string(), display)
+}
+
+/// Process file name used by the tree header line and lastWindowIdentity.
+fn process_file_name(owner: &str) -> String {
+    owner
+        .strip_prefix("process:")
+        .or_else(|| owner.strip_prefix("process:\\"))
+        .map(|p| p.rsplit(['\\', '/']).next().unwrap_or(p).to_string())
+        .unwrap_or_default()
+}
+
+/// The `App:` field of the tree header line: file name for process
+/// windows, shell display name for packaged apps.
+fn header_app_name(owner: &str) -> String {
+    let file = process_file_name(owner);
+    if !file.is_empty() {
+        return file;
+    }
+    canonical_approval_app(owner).1
 }
 
 /// Returns Some(approval response) when the app has not been approved in
@@ -302,21 +325,16 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             Response::Result(json!({}))
         }
         "diagnostic_state" => Response::Result(json!({
-            "engine": "sky-engine",
-            "version": env!("CARGO_PKG_VERSION"),
-            "snapshotRevision": st.snapshot_revision,
-            "accessibilityRevision": st.snapshot_revision,
-            "accessibilitySnapshotCount": st
-                .snapshots
-                .values()
-                .map(|s| s.elements.len())
-                .sum::<usize>(),
-            "captureCachedSessionCount": st
-                .snapshots
-                .values()
-                .filter(|s| !s.shot_ids.is_empty())
-                .count(),
-            "lastCaptureInvalidationReason": st.last_capture_invalidation,
+            "cacheDiagnostics": {
+                "accessibilityRevision": st.snapshot_revision,
+                "accessibilitySnapshotCount": st.snapshot_count,
+                "captureCachedSessionCount": st
+                    .snapshots
+                    .values()
+                    .filter(|s| !s.shot_ids.is_empty())
+                    .count(),
+            },
+            "lastWindowIdentity": st.last_window_identity,
         })),
 
         "list_windows" => {
@@ -520,7 +538,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
             {
                 Ok((_r, (el, _rect))) => {
-                    match el.get_cached_pattern::<uiautomation::patterns::UIValuePattern>() {
+                    match el.get_pattern::<uiautomation::patterns::UIValuePattern>() {
                         Ok(pattern) => match pattern.set_value(&want) {
                             Ok(()) => Response::Result(json!({})),
                             Err(e) => Response::Error(format!("set value failed: {e}")),
@@ -554,11 +572,11 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                     use uiautomation::types::ScrollAmount;
                     let outcome: Result<(), String> = match action.as_str() {
                         "Expand" => el
-                            .get_cached_pattern::<UIExpandCollapsePattern>()
+                            .get_pattern::<UIExpandCollapsePattern>()
                             .map_err(|e| format!("element does not support ExpandCollapse: {e}"))
                             .and_then(|p| p.expand().map_err(|e| format!("expand failed: {e}"))),
                         "Collapse" => el
-                            .get_cached_pattern::<UIExpandCollapsePattern>()
+                            .get_pattern::<UIExpandCollapsePattern>()
                             .map_err(|e| format!("element does not support ExpandCollapse: {e}"))
                             .and_then(|p| p.collapse().map_err(|e| format!("collapse failed: {e}"))),
                         "Raise" => {
@@ -566,7 +584,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                             Ok(())
                         }
                         "Scroll Up" => el
-                            .get_cached_pattern::<UIScrollPattern>()
+                            .get_pattern::<UIScrollPattern>()
                             .map_err(|e| format!("element does not support Scroll: {e}"))
                             .and_then(|p| {
                                 p.scroll(ScrollAmount::NoAmount, ScrollAmount::SmallDecrement)
@@ -577,7 +595,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                                 Ok(())
                             }),
                         "Scroll Down" => el
-                            .get_cached_pattern::<UIScrollPattern>()
+                            .get_pattern::<UIScrollPattern>()
                             .map_err(|e| format!("element does not support Scroll: {e}"))
                             .and_then(|p| {
                                 p.scroll(ScrollAmount::NoAmount, ScrollAmount::SmallIncrement)
@@ -588,7 +606,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                                 Ok(())
                             }),
                         "Scroll Left" => el
-                            .get_cached_pattern::<UIScrollPattern>()
+                            .get_pattern::<UIScrollPattern>()
                             .map_err(|e| format!("element does not support Scroll: {e}"))
                             .and_then(|p| {
                                 p.scroll(ScrollAmount::SmallDecrement, ScrollAmount::NoAmount)
@@ -599,7 +617,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                                 Ok(())
                             }),
                         "Scroll Right" => el
-                            .get_cached_pattern::<UIScrollPattern>()
+                            .get_pattern::<UIScrollPattern>()
                             .map_err(|e| format!("element does not support Scroll: {e}"))
                             .and_then(|p| {
                                 p.scroll(ScrollAmount::SmallIncrement, ScrollAmount::NoAmount)
@@ -625,29 +643,34 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            let r = match resolve_and_approve(st, &p.window) {
+            let r = match resolve_win(&p.window).map_err(Response::Error) {
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
+            // Observed order: approval, then the both-false include check,
+            // then the minimized refusal (an approved persistent home
+            // answers both-false with the window echo even while iconic).
+            if let Some(a) = approval_required(st, &r.owner) {
+                return a;
+            }
             if !p.include_screenshot && !p.include_text {
                 return Response::Error(
                     "get_window_state must request include_text, include_screenshot, or both".into(),
                 );
             }
+            if unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(r.hwnd).as_bool() } {
+                return Response::Error(
+                    "window is minimized; call activate_window, refresh with get_window, then retry get_window_state".into(),
+                );
+            }
             let hwnd = r.hwnd;
-            // Echo the window descriptor with the shell display name.
             let recs = enumerate::enumerate_top_level();
             let rec = recs.iter().find(|w| w.hwnd as u64 == p.window.id);
-            let (_key, display) = canonical_approval_app(&r.owner);
-            let mut window = json!({
-                "app": r.owner,
-                "id": hwnd.0 as isize,
-                "title": rec.map(|w| w.title.clone()).unwrap_or_default(),
+            let title = rec.map(|w| w.title.clone()).unwrap_or_default();
+            let mut result = json!({
+                "window": { "app": r.owner.clone(), "id": hwnd.0 as isize, "title": title },
+                "screenshots": json!([]),
             });
-            if !display.is_empty() {
-                window["displayName"] = json!(display);
-            }
-            let mut result = json!({ "window": window });
 
             if p.include_screenshot {
                 match crate::win::capture::capture_window_jpeg(hwnd) {
@@ -670,51 +693,111 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                     // degrade to no screenshots like the original.
                     Err(e) => {
                         st.last_capture_invalidation = Some(e);
-                        result["screenshots"] = json!([]);
                     }
                 }
             }
 
             if p.include_text {
-                match crate::win::uia::build_tree(hwnd) {
-                    Ok(built) => {
-                        let mut acc = json!({});
-                        if !built.tree.is_empty() {
-                            acc["tree"] = json!(built.tree);
-                        }
-                        if let Some(f) = built.focused {
-                            acc["focused"] = f;
-                        }
-                        let shot_ids: Vec<String> = result
-                            .get("screenshots")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|s| {
-                                        s.get("id").and_then(Value::as_str).map(String::from)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        st.snapshots.insert(
-                            hwnd.0 as isize,
-                            crate::state::WindowSnapshot {
-                                hwnd: hwnd.0 as isize,
-                                taken_ms: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0),
-                                origin: r.origin,
-                                elements: built.elements,
-                                shot_ids,
-                            },
-                        );
-                        st.snapshot_revision += 1;
-                        result["accessibility"] = acc;
+                // Snapshot cache: replay the rendered tree while the window
+                // is unchanged (the original keeps the revision stable).
+                let key = hwnd.0 as isize;
+                let hit = st.snapshots.get(&key).and_then(|s| {
+                    if s.title == title
+                        && s.origin == r.origin
+                        && s.size == r.size
+                        && !s.tree.is_empty()
+                    {
+                        Some((s.tree.clone(), s.focused_element.clone(), s.document_text.clone()))
+                    } else {
+                        None
                     }
-                    Err(_) => result["accessibility"] = json!({}),
+                });
+                let (tree, focused_element, document_text) = match hit {
+                    Some(t) => t,
+                    None => {
+                        let app_name = header_app_name(&r.owner);
+                        match crate::win::uia::build_tree(hwnd, &app_name) {
+                            Ok(built) => {
+                                let shot_ids: Vec<String> = result
+                                    .get("screenshots")
+                                    .and_then(Value::as_array)
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|s| {
+                                                s.get("id").and_then(Value::as_str).map(String::from)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let tup = (
+                                    built.tree.clone(),
+                                    built.focused_element.clone(),
+                                    built.document_text.clone(),
+                                );
+                                st.snapshots.insert(
+                                    key,
+                                    crate::state::WindowSnapshot {
+                                        hwnd: key,
+                                        taken_ms: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0),
+                                        origin: r.origin,
+                                        size: r.size,
+                                        elements: built.elements,
+                                        shot_ids,
+                                        tree: built.tree,
+                                        focused_element: built.focused_element,
+                                        document_text: built.document_text,
+                                        title: title.clone(),
+                                    },
+                                );
+                                // Original: +1 revision / +3 snapshot entries
+                                // per freshly built tree.
+                                st.snapshot_revision += 1;
+                                st.snapshot_count += 3;
+                                st.last_window_identity = Some(json!({
+                                    "appId": r.owner,
+                                    "bounds": {
+                                        "originX": r.origin.0,
+                                        "originY": r.origin.1,
+                                        "width": r.size.0,
+                                        "height": r.size.1,
+                                    },
+                                    "inputHwnd": (hwnd.0 as isize).to_string(),
+                                    "processId": r.pid,
+                                    "processName": process_file_name(&r.owner),
+                                    "rootHwnd": (hwnd.0 as isize).to_string(),
+                                    "snapshotRevision": st.snapshot_revision,
+                                    "title": title,
+                                }));
+                                tup
+                            }
+                            Err(_) => (String::new(), None, None),
+                        }
+                    }
+                };
+                let mut acc = json!({});
+                if !tree.is_empty() {
+                    acc["tree"] = json!(tree);
+                    if let Some(f) = focused_element {
+                        acc["focused_element"] = json!(f);
+                    }
+                    if let Some(d) = document_text {
+                        acc["document_text"] = json!(d);
+                    }
                 }
+                result["accessibility"] = acc;
             }
+            result["cacheDiagnostics"] = json!({
+                "accessibilityRevision": st.snapshot_revision,
+                "accessibilitySnapshotCount": st.snapshot_count,
+                "captureCachedSessionCount": st
+                    .snapshots
+                    .values()
+                    .filter(|s| !s.shot_ids.is_empty())
+                    .count(),
+            });
             Response::Result(result)
         }
         "launch_app" => {

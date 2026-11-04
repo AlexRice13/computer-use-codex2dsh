@@ -108,6 +108,13 @@ fn harden_env() {
 }
 
 fn main() -> ExitCode {
+    // The original helper is a per-monitor DPI-aware process: UIA rectangles
+    // and SendInput coordinates are physical pixels.
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
     harden_env();
     // Private debug mode (not part of the RPC contract): capture one frame.
     {

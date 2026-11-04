@@ -10,9 +10,17 @@ pub struct WindowSnapshot {
     pub taken_ms: u64,
     /// Window origin when captured; tree rects are screen-space.
     pub origin: (i32, i32),
+    /// Window size when captured (cheap snapshot invalidation check).
+    pub size: (i32, i32),
     pub elements: Vec<crate::win::uia::ElementRecord>,
     /// Ids of screenshots handed out with this snapshot.
     pub shot_ids: Vec<String>,
+    /// Rendered tree text (replayed on cache hits, revision stays put).
+    pub tree: String,
+    pub focused_element: Option<String>,
+    pub document_text: Option<String>,
+    /// Window title when captured (cheap invalidation check).
+    pub title: String,
 }
 
 /// Process-wide helper state. The RPC channel is serialized, so this lives
@@ -30,8 +38,13 @@ pub struct EngineState {
     /// Monotonic counter bumped on every successful accessibility snapshot
     /// (diagnostic_state: snapshotRevision/accessibilityRevision).
     pub snapshot_revision: u64,
+    /// Number of cached snapshot artifacts (original: 3 per captured tree).
+    pub snapshot_count: u64,
     /// Reason the last capture attempt failed, cleared on success.
     pub last_capture_invalidation: Option<String>,
+    /// Identity of the last window a snapshot was taken of
+    /// (diagnostic_state: lastWindowIdentity).
+    pub last_window_identity: Option<serde_json::Value>,
 }
 
 impl EngineState {
@@ -42,7 +55,9 @@ impl EngineState {
             last_turn_key: None,
             snapshots: HashMap::new(),
             snapshot_revision: 0,
+            snapshot_count: 0,
             last_capture_invalidation: None,
+            last_window_identity: None,
         }
     }
 }
