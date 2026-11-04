@@ -71,6 +71,40 @@ fn harden_env() {
             std::env::set_var("TMP", &tmp);
         }
     }
+    // Profile-scoped folders: PowerShell's Get-StartApps and the shell's
+    // per-user AppModel views silently degrade to almost nothing without
+    // USERPROFILE/APPDATA/LOCALAPPDATA.
+    {
+        use windows::Win32::UI::Shell::SHGetFolderPathW;
+        let shell_folder = |csidl: i32| -> Option<String> {
+            let mut buf = [0u16; windows::Win32::Foundation::MAX_PATH as usize];
+            unsafe {
+                SHGetFolderPathW(None, csidl, None, 0, &mut buf)
+                    .ok()
+                    .map(|_| String::from_utf16_lossy(&buf[..buf.iter().position(|c| *c == 0).unwrap_or(0)]))
+            }
+        };
+        if std::env::var_os("USERPROFILE").is_none() {
+            if let Some(p) = shell_folder(40 /* CSIDL_PROFILE */) {
+                std::env::set_var("USERPROFILE", p);
+            }
+        }
+        if std::env::var_os("APPDATA").is_none() {
+            if let Some(p) = shell_folder(26 /* CSIDL_APPDATA */) {
+                std::env::set_var("APPDATA", p);
+            }
+        }
+        if std::env::var_os("LOCALAPPDATA").is_none() {
+            if let Some(p) = shell_folder(28 /* CSIDL_LOCAL_APPDATA */) {
+                std::env::set_var("LOCALAPPDATA", p);
+            }
+        }
+        if std::env::var_os("HOME").is_none() {
+            if let Some(p) = std::env::var_os("USERPROFILE") {
+                std::env::set_var("HOME", p);
+            }
+        }
+    }
 }
 
 fn main() -> ExitCode {

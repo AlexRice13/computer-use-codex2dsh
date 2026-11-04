@@ -51,7 +51,6 @@ impl EngineState {
 pub enum Response {
     Result(serde_json::Value),
     Error(String),
-    #[allow(dead_code)] // approval path is dormant: stub policy = default_app_access allow
     Approval {
         app: String,
         display_name: String,

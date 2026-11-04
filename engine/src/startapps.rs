@@ -83,23 +83,30 @@ fn write_cache(path: &PathBuf, entries: &[(String, String)]) {
 }
 
 fn fetch() -> Option<Vec<(String, String)>> {
+    // Mirror the taskbar probe: PowerShell writes the JSON into a temp file
+    // instead of piping stdout, which is the capture mode proven reliable
+    // across the host/parent process chains.
+    let tmp = crate::win::taskbar::tmp_dir().join(format!("startapps-fetch-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
     let ps = PathBuf::from(crate::win::taskbar::powershell_path());
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Get-StartApps | ConvertTo-Json -Compress | Set-Content -LiteralPath '{}' -Encoding UTF8",
+        tmp.display()
+    );
     let out = std::process::Command::new(ps)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-StartApps | ConvertTo-Json -Compress",
-        ])
-        .stdout(std::process::Stdio::piped())
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim_start_matches('\u{feff}').to_string();
+    let text = std::fs::read_to_string(&tmp).ok()?;
+    let _ = std::fs::remove_file(&tmp);
+    let text = text.trim().trim_start_matches('\u{feff}').to_string();
     let root: serde_json::Value = serde_json::from_str(&text).ok()?;
     // Single-app results serialize as one object rather than an array.
     match &root {

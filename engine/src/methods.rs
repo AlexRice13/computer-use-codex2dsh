@@ -1,8 +1,286 @@
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, GetWindowThreadProcessId};
 
 use crate::catalog;
 use crate::state::{EngineState, Response};
 use crate::win::enumerate;
+
+// ---------------------------------------------------------------------------
+// Strict parameter parsing. The original helper parses every request into
+// typed structs, so errors are byte-exact serde messages prefixed with
+// `parse {method} params: `.
+// ---------------------------------------------------------------------------
+
+fn parse_params<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T, String> {
+    serde_json::from_value(params.clone()).map_err(|e| format!("parse {method} params: {e}"))
+}
+
+fn always_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct WinRef {
+    #[serde(default)]
+    app: Option<String>,
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct WindowOnly {
+    window: WinRef,
+}
+
+#[derive(Deserialize)]
+struct GwsParams {
+    window: WinRef,
+    #[serde(default = "always_true", rename = "include_screenshot")]
+    include_screenshot: bool,
+    #[serde(default = "always_true", rename = "include_text")]
+    include_text: bool,
+}
+
+#[derive(Deserialize)]
+struct TypeParams {
+    window: WinRef,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct KeyParams {
+    window: WinRef,
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct ClickParams {
+    window: WinRef,
+    x: i32,
+    y: i32,
+    /// The original parses coordinates but never requires the id; the
+    /// wrapper enforces freshness on its side.
+    #[serde(default, rename = "screenshotId")]
+    #[allow(dead_code)]
+    screenshot_id: Option<String>,
+    #[serde(default, rename = "mouse_button")]
+    mouse_button: Option<String>,
+    #[serde(default, rename = "click_count")]
+    click_count: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ScrollParams {
+    window: WinRef,
+    x: i32,
+    y: i32,
+    #[serde(default, rename = "screenshotId")]
+    #[allow(dead_code)]
+    screenshot_id: Option<String>,
+    #[serde(default, rename = "scrollX")]
+    scroll_x: i64,
+    #[serde(default, rename = "scrollY")]
+    scroll_y: i64,
+}
+
+#[derive(Deserialize)]
+struct DragParams {
+    window: WinRef,
+    #[serde(rename = "from_x")]
+    from_x: i32,
+    #[serde(rename = "from_y")]
+    from_y: i32,
+    #[serde(rename = "to_x")]
+    to_x: i32,
+    #[serde(rename = "to_y")]
+    to_y: i32,
+    #[serde(default, rename = "screenshotId")]
+    #[allow(dead_code)]
+    screenshot_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ElementParams {
+    window: WinRef,
+    #[serde(rename = "element_index")]
+    element_index: u64,
+    #[serde(default, rename = "mouse_button")]
+    mouse_button: Option<String>,
+    #[serde(default, rename = "click_count")]
+    click_count: Option<u64>,
+    #[serde(default, rename = "scrollX")]
+    scroll_x: i64,
+    #[serde(default, rename = "scrollY")]
+    scroll_y: i64,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GetWindowFlat {
+    #[serde(default)]
+    app: Option<String>,
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct LaunchParams {
+    app: String,
+}
+
+// ---------------------------------------------------------------------------
+// Window resolution — the original's order and exact messages:
+//   id == 0        -> "window id is required"
+//   pid missing    -> "foreground window did not report a process id"
+//   unaddressable  -> "window is not a usable app window"
+//   no app given   -> "window.app is required"
+//   app mismatch   -> "window id {id} no longer belongs to {app}; current owner is {owner}"
+// ---------------------------------------------------------------------------
+
+struct Resolved {
+    hwnd: HWND,
+    origin: (i32, i32),
+    owner: String,
+}
+
+fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
+    if w.id == 0 {
+        return Err("window id is required".into());
+    }
+    let hwnd = HWND(w.id as *mut core::ffi::c_void);
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid == 0 {
+        return Err("foreground window did not report a process id".into());
+    }
+    // The original checks the app hint before resolving the owner.
+    let app = w
+        .app
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "window.app is required".to_string())?;
+    // Owner identity: enumerate's (taskbar-corrected) form first, then the
+    // shell property store / image-path fallback.
+    let owner = enumerate::enumerate_top_level()
+        .into_iter()
+        .find(|r| r.hwnd as u64 == w.id)
+        .map(|r| r.app)
+        .or_else(|| crate::win::identity::app_id_for_window(hwnd, pid))
+        .ok_or_else(|| "window is not a usable app window".to_string())?;
+    if !owner.eq_ignore_ascii_case(app) {
+        return Err(format!(
+            "window id {} no longer belongs to {}; current owner is {}",
+            w.id, app, owner
+        ));
+    }
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut rect);
+    }
+    Ok(Resolved {
+        hwnd,
+        origin: (rect.left, rect.top),
+        owner,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Per-app approval gate (spec §B.1). The original gates every app-touching
+// operation behind a first-touch approvalRequest, even when the (stub)
+// policy answers default_app_access=allow. Enumeration/diagnostic methods
+// are not gated. Canonical identity shapes (observed):
+//   process windows -> lowercase file name ("deepseek harness.exe")
+//   packaged apps   -> the AUMID verbatim
+// ---------------------------------------------------------------------------
+
+fn canonical_approval_app(owner: &str) -> (String, String) {
+    if let Some(path) = owner
+        .strip_prefix("process:")
+        .or_else(|| owner.strip_prefix("process:\\"))
+    {
+        let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+        let display = file
+            .strip_suffix(".exe")
+            .or_else(|| file.strip_suffix(".EXE"))
+            .unwrap_or(file)
+            .to_string();
+        return (file.to_lowercase(), display);
+    }
+    // AUMID: the raw Get-StartApps table is the original's display-name
+    // source (catalog rows alone miss unused packages like Calculator).
+    let display = crate::startapps::collect()
+        .into_iter()
+        .find(|(_n, id)| id.eq_ignore_ascii_case(owner))
+        .map(|(n, _)| n)
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| {
+            let recs = enumerate::enumerate_top_level();
+            let cats = catalog::build_catalog(&recs);
+            cats.iter()
+                .find(|c| c.id.eq_ignore_ascii_case(owner))
+                .and_then(|c| c.display_name.clone())
+                .filter(|d| !d.is_empty())
+        })
+        .unwrap_or_else(|| {
+            owner
+                .rsplit(['!', '_'])
+                .next()
+                .unwrap_or(owner)
+                .to_string()
+        });
+    (owner.to_string(), display)
+}
+
+/// Returns Some(approval response) when the app has not been approved in
+/// this turn yet; None when execution may proceed.
+fn approval_required(st: &EngineState, owner: &str) -> Option<Response> {
+    let (app_key, display_name) = canonical_approval_app(owner);
+    if st.approved_apps.contains(&app_key.to_lowercase()) {
+        return None;
+    }
+    Some(Response::Approval {
+        app: app_key,
+        display_name,
+        risk_level: Some("low".into()),
+        allow_persistent_approval: true,
+    })
+}
+
+/// Resolve window + gate approval in one step for all touching methods.
+fn resolve_and_approve(st: &EngineState, w: &WinRef) -> Result<Resolved, Response> {
+    let r = resolve_win(w).map_err(Response::Error)?;
+    if let Some(a) = approval_required(st, &r.owner) {
+        return Err(a);
+    }
+    Ok(r)
+}
+
+/// Latest-snapshot element lookup for element_index actions.
+fn snapshot_element(
+    st: &EngineState,
+    r: &Resolved,
+    index: u64,
+) -> Result<(uiautomation::UIElement, (i32, i32, i32, i32)), String> {
+    let snap = st
+        .snapshots
+        .get(&(r.hwnd.0 as isize))
+        .ok_or_else(|| "no snapshot for window; call get_window_state first".to_string())?;
+    let rec = snap
+        .elements
+        .get(index as usize)
+        .ok_or_else(|| format!("element_index {index} is out of range for the latest snapshot ({} elements)", snap.elements.len()))?;
+    Ok((rec.element.clone(), rec.rect))
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
 
 /// Serialized RPC dispatch (the channel is single-threaded by contract).
 pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value) -> Response {
@@ -50,14 +328,17 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             Response::Result(Value::Array(arr))
         }
         "get_window" => {
-            let want_id = params.get("id").and_then(|v| {
-                v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-            });
-            let want_app = params.get("app").and_then(Value::as_str);
+            let p: GetWindowFlat = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
             let recs = enumerate::enumerate_top_level();
             let hit = recs.into_iter().find(|r| {
-                want_id == Some(r.hwnd as i64)
-                    && want_app.map(|a| a.eq_ignore_ascii_case(&r.app)).unwrap_or(true)
+                p.id == r.hwnd as u64
+                    && p.app
+                        .as_deref()
+                        .map(|a| a.eq_ignore_ascii_case(&r.app))
+                        .unwrap_or(true)
             });
             match hit {
                 Some(r) => Response::Result(json!({ "app": r.app, "id": r.hwnd, "title": r.title })),
@@ -95,277 +376,361 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 .collect();
             Response::Result(Value::Array(arr))
         }
-        "activate_window" => match resolve_window(params) {
-            Ok((hwnd, _)) => {
-                crate::win::input::activate(hwnd);
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "type_text" => match resolve_window(params) {
-            Ok((_hwnd, _)) => {
-                let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-                crate::win::input::type_text(text);
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "press_key" => match resolve_window(params) {
-            Ok((_hwnd, _)) => {
-                let key = params.get("key").and_then(Value::as_str).unwrap_or("");
-                match crate::win::input::press_key(key) {
-                    Ok(()) => Response::Result(json!({})),
-                    Err(e) => Response::Error(e),
-                }
-            }
-            Err(e) => Response::Error(e),
-        },
-        "click" => match resolve_window(params) {
-            Ok((_hwnd, origin)) => {
-                let x = snapshot_x(params, origin.0);
-                let y = snapshot_y(params, origin.1);
-                let button = match params.get("mouse_button").and_then(Value::as_str) {
-                    Some("right") => crate::win::input::Button::Right,
-                    Some("middle") => crate::win::input::Button::Middle,
-                    _ => crate::win::input::Button::Left,
-                };
-                let count = params.get("click_count").and_then(Value::as_u64).unwrap_or(1) as u32;
-                crate::win::input::click(x, y, button, count);
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "scroll" => match resolve_window(params) {
-            Ok((_hwnd, origin)) => {
-                let x = snapshot_x(params, origin.0);
-                let y = snapshot_y(params, origin.1);
-                let sx = params.get("scrollX").and_then(Value::as_i64).unwrap_or(0) as i32;
-                let sy = params.get("scrollY").and_then(Value::as_i64).unwrap_or(0) as i32;
-                crate::win::input::wheel(x, y, sx, sy);
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "drag" => match resolve_window(params) {
-            Ok((_hwnd, origin)) => {
-                let fx = snapshot_num(params, "from_x", origin.0);
-                let fy = snapshot_num(params, "from_y", origin.1);
-                let tx = snapshot_num(params, "to_x", origin.0);
-                let ty = snapshot_num(params, "to_y", origin.1);
-                crate::win::input::drag((fx, fy), (tx, ty));
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "click_element" => match resolve_element(st, params) {
-            Ok((hwnd, _el, rect)) => {
-                let cx = rect.0 + rect.2 / 2;
-                let cy = rect.1 + rect.3 / 2;
-                crate::win::input::activate(hwnd);
-                let button = match params.get("mouse_button").and_then(Value::as_str) {
-                    Some("right") => crate::win::input::Button::Right,
-                    Some("middle") => crate::win::input::Button::Middle,
-                    _ => crate::win::input::Button::Left,
-                };
-                let count = params.get("click_count").and_then(Value::as_u64).unwrap_or(1) as u32;
-                crate::win::input::click(cx, cy, button, count);
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "scroll_element" => match resolve_element(st, params) {
-            Ok((_hwnd, _el, rect)) => {
-                let cx = rect.0 + rect.2 / 2;
-                let cy = rect.1 + rect.3 / 2;
-                let sx = params.get("scrollX").and_then(Value::as_i64).unwrap_or(0) as i32;
-                let sy = params.get("scrollY").and_then(Value::as_i64).unwrap_or(0) as i32;
-                crate::win::input::wheel(cx, cy, sx, sy);
-                Response::Result(json!({}))
-            }
-            Err(e) => Response::Error(e),
-        },
-        "set_value" => match resolve_element(st, params) {
-            Ok((_hwnd, el, _rect)) => {
-                let want = params.get("value").and_then(Value::as_str).unwrap_or("");
-                match el.get_cached_pattern::<uiautomation::patterns::UIValuePattern>() {
-                    Ok(pattern) => match pattern.set_value(want) {
-                        Ok(()) => Response::Result(json!({})),
-                        Err(e) => Response::Error(format!("set value failed: {e}")),
-                    },
-                    Err(e) => Response::Error(format!("element does not support ValuePattern: {e}")),
-                }
-            }
-            Err(e) => Response::Error(e),
-        },
-        "perform_secondary_action" => match resolve_element(st, params) {
-            Ok((hwnd, el, rect)) => {
-                let action = params.get("action").and_then(Value::as_str).unwrap_or("");
-                let cx = rect.0 + rect.2 / 2;
-                let cy = rect.1 + rect.3 / 2;
-                use uiautomation::patterns::{
-                    UIExpandCollapsePattern, UIScrollPattern,
-                };
-                use uiautomation::types::ScrollAmount;
-                let outcome: Result<(), String> = match action {
-                    "Expand" => el
-                        .get_cached_pattern::<UIExpandCollapsePattern>()
-                        .map_err(|e| format!("element does not support ExpandCollapse: {e}"))
-                        .and_then(|p| p.expand().map_err(|e| format!("expand failed: {e}"))),
-                    "Collapse" => el
-                        .get_cached_pattern::<UIExpandCollapsePattern>()
-                        .map_err(|e| format!("element does not support ExpandCollapse: {e}"))
-                        .and_then(|p| p.collapse().map_err(|e| format!("collapse failed: {e}"))),
-                    "Raise" => {
-                        crate::win::input::activate(hwnd);
-                        Ok(())
-                    }
-                    "Scroll Up" => el
-                        .get_cached_pattern::<UIScrollPattern>()
-                        .map_err(|e| format!("element does not support Scroll: {e}"))
-                        .and_then(|p| {
-                            p.scroll(ScrollAmount::NoAmount, ScrollAmount::SmallDecrement)
-                                .map_err(|e| format!("scroll failed: {e}"))
-                        })
-                        .or_else(|_| {
-                            crate::win::input::wheel(cx, cy, 0, 3);
-                            Ok(())
-                        }),
-                    "Scroll Down" => el
-                        .get_cached_pattern::<UIScrollPattern>()
-                        .map_err(|e| format!("element does not support Scroll: {e}"))
-                        .and_then(|p| {
-                            p.scroll(ScrollAmount::NoAmount, ScrollAmount::SmallIncrement)
-                                .map_err(|e| format!("scroll failed: {e}"))
-                        })
-                        .or_else(|_| {
-                            crate::win::input::wheel(cx, cy, 0, -3);
-                            Ok(())
-                        }),
-                    "Scroll Left" => el
-                        .get_cached_pattern::<UIScrollPattern>()
-                        .map_err(|e| format!("element does not support Scroll: {e}"))
-                        .and_then(|p| {
-                            p.scroll(ScrollAmount::SmallDecrement, ScrollAmount::NoAmount)
-                                .map_err(|e| format!("scroll failed: {e}"))
-                        })
-                        .or_else(|_| {
-                            crate::win::input::wheel(cx, cy, 3, 0);
-                            Ok(())
-                        }),
-                    "Scroll Right" => el
-                        .get_cached_pattern::<UIScrollPattern>()
-                        .map_err(|e| format!("element does not support Scroll: {e}"))
-                        .and_then(|p| {
-                            p.scroll(ScrollAmount::SmallIncrement, ScrollAmount::NoAmount)
-                                .map_err(|e| format!("scroll failed: {e}"))
-                        })
-                        .or_else(|_| {
-                            crate::win::input::wheel(cx, cy, -3, 0);
-                            Ok(())
-                        }),
-                    other => Err(format!("unsupported secondary action: {other}")),
-                };
-                match outcome {
-                    Ok(()) => Response::Result(json!({})),
-                    Err(e) => Response::Error(e),
-                }
-            }
-            Err(e) => Response::Error(e),
-        },
-        "get_window_state" => {
-            let include_shot = params
-                .get("include_screenshot")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let include_text = params
-                .get("include_text")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            match resolve_window(params) {
-                Ok((hwnd, origin)) => {
-                    // Echo the window descriptor the caller addressed.
-                    let recs = enumerate::enumerate_top_level();
-                    let rec = recs.iter().find(|r| r.hwnd as isize == hwnd.0 as isize);
-                    let window = json!({
-                        "app": params.get("window").and_then(|w| w.get("app")).and_then(Value::as_str)
-                            .map(Value::from).unwrap_or_else(|| json!(rec.map(|r| r.app.clone()).unwrap_or_default())),
-                        "id": hwnd.0 as isize,
-                        "title": rec.map(|r| r.title.clone()).unwrap_or_default(),
-                    });
-                    let mut result = json!({ "window": window });
 
-                    if include_shot {
-                        match crate::win::capture::capture_window_jpeg(hwnd) {
-                            Ok((jpeg, w, h)) => {
-                                st.last_capture_invalidation = None;
-                                use base64::Engine as _;
-                                let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-                                result["screenshots"] = json!([{
-                                    "id": "shot-1",
-                                    "url": format!("data:image/jpeg;base64,{b64}"),
-                                    "originX": 0,
-                                    "originY": 0,
-                                    "width": w,
-                                    "height": h,
-                                    "zIndex": 0,
-                                    "hasContent": true,
-                                }]);
-                            }
-                            // Uncapturable (locked session, protected window):
-                            // degrade to no screenshots like the original.
-                            Err(e) => {
-                                st.last_capture_invalidation = Some(e);
-                                result["screenshots"] = json!([]);
-                            }
-                        }
-                    }
-
-                    if include_text {
-                        match crate::win::uia::build_tree(hwnd) {
-                            Ok(built) => {
-                                let mut acc = json!({});
-                                if !built.tree.is_empty() {
-                                    acc["tree"] = json!(built.tree);
-                                }
-                                if let Some(f) = built.focused {
-                                    acc["focused"] = f;
-                                }
-                                let shot_ids: Vec<String> = result
-                                    .get("screenshots")
-                                    .and_then(Value::as_array)
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|s| s.get("id").and_then(Value::as_str).map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                st.snapshots.insert(
-                                    hwnd.0 as isize,
-                                    crate::state::WindowSnapshot {
-                                        hwnd: hwnd.0 as isize,
-                                        taken_ms: std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_millis() as u64)
-                                            .unwrap_or(0),
-                                        origin,
-                                        elements: built.elements,
-                                        shot_ids,
-                                    },
-                                );
-                                st.snapshot_revision += 1;
-                                result["accessibility"] = acc;
-                            }
-                            Err(_) => result["accessibility"] = json!({}),
-                        }
-                    }
-                    Response::Result(result)
+        "activate_window" => {
+            let p: WindowOnly = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window) {
+                Ok(r) => {
+                    crate::win::input::activate(r.hwnd);
+                    Response::Result(json!({}))
                 }
-                Err(e) => Response::Error(e),
+                Err(resp) => resp,
             }
         }
+        "type_text" => {
+            let p: TypeParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window) {
+                Ok(_r) => {
+                    crate::win::input::type_text(&p.text);
+                    Response::Result(json!({}))
+                }
+                Err(resp) => resp,
+            }
+        }
+        "press_key" => {
+            let p: KeyParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window) {
+                Ok(_r) => match crate::win::input::press_key(&p.key) {
+                    Ok(()) => Response::Result(json!({})),
+                    Err(e) => Response::Error(e),
+                },
+                Err(resp) => resp,
+            }
+        }
+        "click" => {
+            let p: ClickParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window) {
+                Ok(r) => {
+                    let x = r.origin.0 + p.x;
+                    let y = r.origin.1 + p.y;
+                    let button = match p.mouse_button.as_deref() {
+                        Some("right") => crate::win::input::Button::Right,
+                        Some("middle") => crate::win::input::Button::Middle,
+                        _ => crate::win::input::Button::Left,
+                    };
+                    crate::win::input::click(x, y, button, p.click_count.unwrap_or(1) as u32);
+                    Response::Result(json!({}))
+                }
+                Err(resp) => resp,
+            }
+        }
+        "scroll" => {
+            let p: ScrollParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window) {
+                Ok(r) => {
+                    let x = r.origin.0 + p.x;
+                    let y = r.origin.1 + p.y;
+                    crate::win::input::wheel(x, y, p.scroll_x as i32, p.scroll_y as i32);
+                    Response::Result(json!({}))
+                }
+                Err(resp) => resp,
+            }
+        }
+        "drag" => {
+            let p: DragParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window) {
+                Ok(r) => {
+                    let from = (r.origin.0 + p.from_x, r.origin.1 + p.from_y);
+                    let to = (r.origin.0 + p.to_x, r.origin.1 + p.to_y);
+                    crate::win::input::drag(from, to);
+                    Response::Result(json!({}))
+                }
+                Err(resp) => resp,
+            }
+        }
+
+        "click_element" => {
+            let p: ElementParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window)
+                .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
+            {
+                Ok((_r, (_el, rect))) => {
+                    let cx = rect.0 + rect.2 / 2;
+                    let cy = rect.1 + rect.3 / 2;
+                    crate::win::input::activate(_r.hwnd);
+                    let button = match p.mouse_button.as_deref() {
+                        Some("right") => crate::win::input::Button::Right,
+                        Some("middle") => crate::win::input::Button::Middle,
+                        _ => crate::win::input::Button::Left,
+                    };
+                    crate::win::input::click(cx, cy, button, p.click_count.unwrap_or(1) as u32);
+                    Response::Result(json!({}))
+                }
+                Err(resp) => resp,
+            }
+        }
+        "scroll_element" => {
+            let p: ElementParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            match resolve_and_approve(st, &p.window)
+                .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
+            {
+                Ok((_r, (_el, rect))) => {
+                    let cx = rect.0 + rect.2 / 2;
+                    let cy = rect.1 + rect.3 / 2;
+                    crate::win::input::wheel(cx, cy, p.scroll_x as i32, p.scroll_y as i32);
+                    Response::Result(json!({}))
+                }
+                Err(resp) => resp,
+            }
+        }
+        "set_value" => {
+            let p: ElementParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            let want = match p.value.clone() {
+                Some(v) => v,
+                None => return Response::Error(format!("parse {method} params: missing field `value`")),
+            };
+            match resolve_and_approve(st, &p.window)
+                .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
+            {
+                Ok((_r, (el, _rect))) => {
+                    match el.get_cached_pattern::<uiautomation::patterns::UIValuePattern>() {
+                        Ok(pattern) => match pattern.set_value(&want) {
+                            Ok(()) => Response::Result(json!({})),
+                            Err(e) => Response::Error(format!("set value failed: {e}")),
+                        },
+                        Err(e) => {
+                            Response::Error(format!("element does not support ValuePattern: {e}"))
+                        }
+                    }
+                }
+                Err(resp) => resp,
+            }
+        }
+        "perform_secondary_action" => {
+            let p: ElementParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            let action = match p.action.clone() {
+                Some(a) => a,
+                None => {
+                    return Response::Error(format!("parse {method} params: missing field `action`"))
+                }
+            };
+            match resolve_and_approve(st, &p.window)
+                .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
+            {
+                Ok((_r, (el, rect))) => {
+                    let cx = rect.0 + rect.2 / 2;
+                    let cy = rect.1 + rect.3 / 2;
+                    use uiautomation::patterns::{UIExpandCollapsePattern, UIScrollPattern};
+                    use uiautomation::types::ScrollAmount;
+                    let outcome: Result<(), String> = match action.as_str() {
+                        "Expand" => el
+                            .get_cached_pattern::<UIExpandCollapsePattern>()
+                            .map_err(|e| format!("element does not support ExpandCollapse: {e}"))
+                            .and_then(|p| p.expand().map_err(|e| format!("expand failed: {e}"))),
+                        "Collapse" => el
+                            .get_cached_pattern::<UIExpandCollapsePattern>()
+                            .map_err(|e| format!("element does not support ExpandCollapse: {e}"))
+                            .and_then(|p| p.collapse().map_err(|e| format!("collapse failed: {e}"))),
+                        "Raise" => {
+                            crate::win::input::activate(_r.hwnd);
+                            Ok(())
+                        }
+                        "Scroll Up" => el
+                            .get_cached_pattern::<UIScrollPattern>()
+                            .map_err(|e| format!("element does not support Scroll: {e}"))
+                            .and_then(|p| {
+                                p.scroll(ScrollAmount::NoAmount, ScrollAmount::SmallDecrement)
+                                    .map_err(|e| format!("scroll failed: {e}"))
+                            })
+                            .or_else(|_| {
+                                crate::win::input::wheel(cx, cy, 0, 3);
+                                Ok(())
+                            }),
+                        "Scroll Down" => el
+                            .get_cached_pattern::<UIScrollPattern>()
+                            .map_err(|e| format!("element does not support Scroll: {e}"))
+                            .and_then(|p| {
+                                p.scroll(ScrollAmount::NoAmount, ScrollAmount::SmallIncrement)
+                                    .map_err(|e| format!("scroll failed: {e}"))
+                            })
+                            .or_else(|_| {
+                                crate::win::input::wheel(cx, cy, 0, -3);
+                                Ok(())
+                            }),
+                        "Scroll Left" => el
+                            .get_cached_pattern::<UIScrollPattern>()
+                            .map_err(|e| format!("element does not support Scroll: {e}"))
+                            .and_then(|p| {
+                                p.scroll(ScrollAmount::SmallDecrement, ScrollAmount::NoAmount)
+                                    .map_err(|e| format!("scroll failed: {e}"))
+                            })
+                            .or_else(|_| {
+                                crate::win::input::wheel(cx, cy, 3, 0);
+                                Ok(())
+                            }),
+                        "Scroll Right" => el
+                            .get_cached_pattern::<UIScrollPattern>()
+                            .map_err(|e| format!("element does not support Scroll: {e}"))
+                            .and_then(|p| {
+                                p.scroll(ScrollAmount::SmallIncrement, ScrollAmount::NoAmount)
+                                    .map_err(|e| format!("scroll failed: {e}"))
+                            })
+                            .or_else(|_| {
+                                crate::win::input::wheel(cx, cy, -3, 0);
+                                Ok(())
+                            }),
+                        other => Err(format!("unsupported secondary action: {other}")),
+                    };
+                    match outcome {
+                        Ok(()) => Response::Result(json!({})),
+                        Err(e) => Response::Error(e),
+                    }
+                }
+                Err(resp) => resp,
+            }
+        }
+
+        "get_window_state" => {
+            let p: GwsParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            let r = match resolve_and_approve(st, &p.window) {
+                Ok(r) => r,
+                Err(resp) => return resp,
+            };
+            if !p.include_screenshot && !p.include_text {
+                return Response::Error(
+                    "get_window_state must request include_text, include_screenshot, or both".into(),
+                );
+            }
+            let hwnd = r.hwnd;
+            // Echo the window descriptor with the shell display name.
+            let recs = enumerate::enumerate_top_level();
+            let rec = recs.iter().find(|w| w.hwnd as u64 == p.window.id);
+            let (_key, display) = canonical_approval_app(&r.owner);
+            let mut window = json!({
+                "app": r.owner,
+                "id": hwnd.0 as isize,
+                "title": rec.map(|w| w.title.clone()).unwrap_or_default(),
+            });
+            if !display.is_empty() {
+                window["displayName"] = json!(display);
+            }
+            let mut result = json!({ "window": window });
+
+            if p.include_screenshot {
+                match crate::win::capture::capture_window_jpeg(hwnd) {
+                    Ok((jpeg, w, h)) => {
+                        st.last_capture_invalidation = None;
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                        result["screenshots"] = json!([{
+                            "id": "shot-1",
+                            "url": format!("data:image/jpeg;base64,{b64}"),
+                            "originX": 0,
+                            "originY": 0,
+                            "width": w,
+                            "height": h,
+                            "zIndex": 0,
+                            "hasContent": true,
+                        }]);
+                    }
+                    // Uncapturable (locked session, protected window):
+                    // degrade to no screenshots like the original.
+                    Err(e) => {
+                        st.last_capture_invalidation = Some(e);
+                        result["screenshots"] = json!([]);
+                    }
+                }
+            }
+
+            if p.include_text {
+                match crate::win::uia::build_tree(hwnd) {
+                    Ok(built) => {
+                        let mut acc = json!({});
+                        if !built.tree.is_empty() {
+                            acc["tree"] = json!(built.tree);
+                        }
+                        if let Some(f) = built.focused {
+                            acc["focused"] = f;
+                        }
+                        let shot_ids: Vec<String> = result
+                            .get("screenshots")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|s| {
+                                        s.get("id").and_then(Value::as_str).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        st.snapshots.insert(
+                            hwnd.0 as isize,
+                            crate::state::WindowSnapshot {
+                                hwnd: hwnd.0 as isize,
+                                taken_ms: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0),
+                                origin: r.origin,
+                                elements: built.elements,
+                                shot_ids,
+                            },
+                        );
+                        st.snapshot_revision += 1;
+                        result["accessibility"] = acc;
+                    }
+                    Err(_) => result["accessibility"] = json!({}),
+                }
+            }
+            Response::Result(result)
+        }
         "launch_app" => {
-            let app = params.get("app").and_then(Value::as_str).unwrap_or("");
-            match crate::launch::launch(app) {
+            let p: LaunchParams = match parse_params(method, params) {
+                Ok(p) => p,
+                Err(e) => return Response::Error(e),
+            };
+            let plan = match crate::launch::plan(&p.app) {
+                Ok(plan) => plan,
+                Err(e) => return Response::Error(e),
+            };
+            let owner = crate::launch::plan_owner(&plan);
+            if let Some(a) = approval_required(st, &owner) {
+                return a;
+            }
+            match crate::launch::execute(&plan) {
                 Ok(()) => Response::Result(json!({})),
                 Err(e) => Response::Error(e),
             }
@@ -379,82 +744,4 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
         }
         other => Response::Error(format!("unsupported method: {other}")),
     }
-}
-
-/// Resolve params.window ({app?, id}) to an HWND plus the window's screen
-/// origin (snapshot-relative coordinates are expressed from that origin).
-fn resolve_window(params: &Value) -> Result<(windows::Win32::Foundation::HWND, (i32, i32)), String> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-    let win = params
-        .get("window")
-        .ok_or_else(|| "missing window".to_string())?;
-    let id = win
-        .get("id")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok())))
-        .ok_or_else(|| "missing window id".to_string())?;
-    let hwnd = HWND(id as *mut core::ffi::c_void);
-    unsafe {
-        if !IsWindow(Some(hwnd)).as_bool() {
-            return Err("window is not a usable app window".into());
-        }
-    }
-    if let Some(app) = win.get("app").and_then(Value::as_str) {
-        // The app hint must still name the same process address.
-        let recs = enumerate::enumerate_top_level();
-        if !recs.iter().any(|r| r.hwnd as i64 == id && r.app.eq_ignore_ascii_case(app)) {
-            // Windows move between enumeration passes; only a changed app
-            // identity is fatal, a vanished window still accepts input if
-            // IsWindow passed above.
-            let still_alive = recs.iter().any(|r| r.hwnd as i64 == id);
-            if !still_alive {
-                let exact_app = recs.iter().any(|r| r.app.eq_ignore_ascii_case(app));
-                if !exact_app {
-                    return Err("window is not a usable app window".into());
-                }
-            }
-        }
-    }
-    let mut rect = windows::Win32::Foundation::RECT::default();
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);
-    }
-    Ok((hwnd, (rect.left, rect.top)))
-}
-
-fn snapshot_num(params: &Value, key: &str, origin: i32) -> i32 {    params
-        .get(key)
-        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
-        .unwrap_or(0) as i32
-        + origin
-}
-
-fn snapshot_x(params: &Value, origin: i32) -> i32 {
-    snapshot_num(params, "x", origin)
-}
-
-/// Resolve params.window + element_index against the latest snapshot of
-/// that window. Returns the HWND, a cloned UIElement, and its screen rect.
-fn resolve_element(
-    st: &EngineState,
-    params: &Value,
-) -> Result<(windows::Win32::Foundation::HWND, uiautomation::UIElement, (i32, i32, i32, i32)), String> {
-    let (hwnd, _) = resolve_window(params)?;
-    let index = params
-        .get("element_index")
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())))
-        .ok_or_else(|| "missing element_index".to_string())? as usize;
-    let snap = st
-        .snapshots
-        .get(&(hwnd.0 as isize))
-        .ok_or_else(|| "no snapshot for window; call get_window_state first".to_string())?;
-    let rec = snap
-        .elements
-        .get(index)
-        .ok_or_else(|| format!("element_index {index} is out of range for the latest snapshot ({} elements)", snap.elements.len()))?;
-    Ok((hwnd, rec.element.clone(), rec.rect))
-}
-
-fn snapshot_y(params: &Value, origin: i32) -> i32 {
-    snapshot_num(params, "y", origin)
 }
