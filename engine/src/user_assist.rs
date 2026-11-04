@@ -247,5 +247,8 @@ pub fn collect() -> HashMap<String, AssistInfo> {
             }
         }
     }
+    // Measured ground truth: the original emits useCount: 0 even when the
+    // record has no last-used date (CPU-Z, clash-verge, Docker Desktop all
+    // render as "0|-"), so never-drop userassist records stay as-is.
     map
 }

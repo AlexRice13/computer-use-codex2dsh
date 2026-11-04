@@ -98,6 +98,8 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
             is_running,
             windows: wins,
             last_used_date: if is_running { None } else { info.last_used_date.clone() },
+            // Measured: the original emits useCount: 0 (with the date) for
+            // launched-then-uncounted records — no omission at zero.
             use_count: if is_running { None } else { Some(info.use_count) },
         });
     }
@@ -236,6 +238,8 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
             is_running,
             windows: wins,
             last_used_date: if is_running { None } else { info.last_used_date.clone() },
+            // Measured: the original emits useCount: 0 (with the date) for
+            // launched-then-uncounted records — no omission at zero.
             use_count: if is_running { None } else { Some(info.use_count) },
         });
     }
