@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "电脑操作（Sky）",
+    "description": "独立的 Windows 电脑操作 Provider。注册桌面工具（列出应用/窗口、获取含截图与 UIA 树的窗口状态、点击、输入、滚动、拖拽），由本地暂存的 Sky 原生助手驱动；运行时完全脱离 ChatGPT 与 Codex，支持逐应用授权和物理 Esc 紧急中断。"
+  }
+}

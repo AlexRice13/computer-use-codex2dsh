@@ -1,0 +1,37 @@
+{
+  "name": "computer-use-codex2dsh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Windows computer-use provider for DeepSeek Harness: drives the host desktop through the Sky computer-use helper (codex-computer-use.exe) staged from a local OpenAI Codex/ChatGPT desktop install; no ChatGPT or Codex process involvement at runtime",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "lib/*.js",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "platforms": ["win32"]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-computer-use": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-mcp-client": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "~3.18.5"
+  }
+}

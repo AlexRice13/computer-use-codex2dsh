@@ -1,0 +1,8 @@
+# Mounts the exclusive computer-use registry and the standalone Sky provider.
+- insert:
+    - id: computer-use-registry
+      name: '@deepseek-ai/dsh-computer-use'
+      config: {}
+    - id: computer-use-sky
+      name: 'computer-use-codex2dsh'
+      config: {}

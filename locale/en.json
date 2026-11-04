@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Computer Use (Sky)",
+    "description": "Standalone Windows computer-use provider. Registers desktop tools (list apps/windows, window state with screenshots and UIA tree, click, type, scroll, drag) driven by the locally staged Sky helper; runs fully detached from ChatGPT and Codex, with per-app approvals and physical-Esc interrupt."
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+*.log
+*.tmp
+tmp/
+stage/
+codex-home/
+.dsh-stage.json
+.DS_Store
+Thumbs.db
