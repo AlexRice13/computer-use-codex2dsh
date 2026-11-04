@@ -1,13 +1,14 @@
 // Standalone Windows computer-use provider for the Harness.
 //
-// It drives the desktop through the Sky computer-use helper
-// (codex-computer-use.exe) over its observed stdio JSON-RPC contract, fully
+// It drives the desktop through the reverse-engineered Sky helper
+// (codex-computer-use.exe) over the observed stdio JSON-RPC contract, fully
 // detached from ChatGPT and Codex at runtime: the helper and a local
 // app-server stub are staged into a private %LOCALAPPDATA% directory and
 // supervised by this plugin. Nothing is read from a ChatGPT/Codex account,
-// and no network access is used. The helper binary is a third-party component
-// supplied by your own OpenAI Codex/ChatGPT desktop installation; it is never
-// downloaded or bundled by this repository.
+// and no network access is used.
+//
+// See SKY_WINDOWS_PROTOCOL_SPEC.md in this package for the protocol evidence
+// and engine/ for the native Rust reimplementation of the helper.
 import Schema from '@deepseek-ai/schemastery';
 import { ComputerUseProviderName } from '@deepseek-ai/dsh-computer-use/brand';
 

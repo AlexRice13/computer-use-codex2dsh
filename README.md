@@ -1,14 +1,37 @@
 # computer-use-codex2dsh
 
-> Give [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) full Windows desktop control: 13 `sky__*` tools driven by the Sky computer-use helper (`codex-computer-use.exe`) from your own local OpenAI Codex/ChatGPT desktop installation.
+> Give [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) full Windows desktop control: 13 `sky__*` tools backed by an **open-source native reimplementation** of the Sky computer-use helper — no ChatGPT/Codex installation required at runtime.
 
-`computer-use-codex2dsh` 是一个独立的 Windows「电脑操作」Cordis 插件：它把 Codex 桌面端附带的 Sky 原生助手（`codex-computer-use.exe`）接到 DeepSeek Harness 上，让模型可以直接查看窗口、点击、打字、滚动、拖拽。插件自身是一个纯 Node.js 的 stdio JSON-RPC 客户端/监管者——**运行时不连接 ChatGPT/Codex 的任何服务，不读取任何账号数据，不使用网络**。
+`computer-use-codex2dsh` 是一个独立的 Windows「电脑操作」Cordis 插件：它把开源原生引擎 `sky-engine`（`engine/`，Rust，逆向复刻 Sky `codex-computer-use.exe` 的 stdio JSON-RPC 契约）接到 DeepSeek Harness 上，让模型可以直接查看窗口、点击、打字、滚动、拖拽。插件自身是一个纯 Node.js 的 stdio JSON-RPC 客户端/监管者——**运行时不连接 ChatGPT/Codex 的任何服务，不读取任何账号数据，不使用网络**。
 
 ## 它做什么
 
 - 向 Harness 注册 13 个 `sky__*` 桌面工具（见下表），独占 `computerUse` 注册槽位。
-- 首次调用时把 helper 与一个本地 `app-server` 桩进程暂存到 `%LOCALAPPDATA%\dsh-computer-use\bin`，以 `--parent-pid` 方式启动并监管；卸载插件时干净回收进程。
+- 首次调用时把 `sky-engine` 与一个本地 `app-server` 桩进程暂存到 `%LOCALAPPDATA%\dsh-computer-use\bin`，以 `--parent-pid` 方式启动并监管；卸载插件时干净回收进程。
 - 结果经 MCP 适配器投影：截图作为图像附件、UIA 树带元素索引；插件层补充了新鲜快照校验、遮挡启发式拒绝、自我排除等守卫。
+
+## 引擎：`engine/`（sky-rs）
+
+`engine/` 是 `codex-computer-use.exe` 的行为兼容开源重实现（Rust，`windows` + `uiautomation` crate）：
+
+- 完整的 20 方法 RPC 面（`list_apps` / `list_windows` / `get_window` / `get_window_state` / `activate_window` / `click` / `click_element` / `scroll_element` / `drag` / `scroll` / `type_text` / `press_key` / `set_value` / `perform_secondary_action` / `launch_app` / `end_turn` / `close` / `diagnostic_state` / `start|stop_audio_recording`），逐条对齐 `SKY_WINDOWS_PROTOCOL_SPEC.md` 的错误文案、审批/回合/预算 meta、130/Esc 中断标记等语义；
+- 窗口/应用枚举（含 taskbar AUMID 探测、StartApps/UserAssist 使用度）、WGC 窗口截图（WIC JPEG 编码）、UIA 元素树与 pattern 动作、SendInput 输入、app-server 握手与策略查询、受限环境变量强化、快照缓存与 `diagnostic_state`。
+
+构建（Windows，[Rust toolchain](https://rustup.rs/)）：
+
+```sh
+cd engine && cargo build --release
+# 产物：engine/target/release/sky-engine.exe
+```
+
+然后把它接到插件（配置任选其一）：
+
+```yaml
+# cordis.patch.yml 的 pluginConfig
+helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
+```
+
+不设 `helperPath` 时插件仍会自动发现本机已安装的 Codex/ChatGPT 桌面版自带的原版助手——两条路线都支持。
 
 ## 工具一览
 
@@ -21,17 +44,14 @@
 | `sky__drag` / `sky__scroll` | 快照坐标拖拽 / 滚动（必须携带 `screenshotId`） |
 | `sky__type_text` / `sky__press_key` | 字面文本输入 / 组合键（`Enter`、`ctrl+s` 等） |
 | `sky__set_value` / `sky__perform_secondary_action` | UIA 值模式写入 / 次级动作（Raise、Scroll Up/Down/Left/Right、Expand、Collapse） |
-| `sky__launch_app` | 按应用 id 或可执行文件路径启动应用 |
+| `sky__launch_app` | 按应用 id、AUMID、可执行文件路径或应用名启动应用 |
 
 ## 前置要求
 
-- **Windows 10/11**（helper 仅存在于 Windows 桌面端）。
+- **Windows 10/11**（桌面自动化仅存在于 Windows）。
 - **DeepSeek Harness**（提供 `@deepseek-ai/cordis` `~4.0.5`、`dsh-tools` / `dsh-system-prompt` / `dsh-computer-use` `0.2.1-rc.5` 等 peer 依赖的宿主环境）。
-- **本机已安装过一次 OpenAI Codex / ChatGPT 桌面版**——插件需要从
-  `%LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node\*\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe`
-  复制原生助手文件；或通过配置 `helperPath` 手动指向你自留的一份 `codex-computer-use.exe`。
-  **本仓库不包含、也不下载该二进制**，请遵守上游许可与服务条款。
 - **Node.js**（`node.exe`，用于运行本地 `app-server` 桩；可用 `nodePath` 指定）。
+- 使用内置开源引擎时**无需**安装 OpenAI Codex / ChatGPT 桌面版。
 
 ## 安装
 
@@ -41,29 +61,33 @@
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `helperPath` | 自动发现 | `codex-computer-use.exe` 的绝对路径 |
+| `helperPath` | 自动发现 | 助手二进制绝对路径——推荐指向 `engine/target/release/sky-engine.exe`；留空则自动发现本机 Codex/ChatGPT 桌面版原版助手 |
 | `nodePath` | 自动发现 | 用于运行 app-server 桩的 `node.exe` |
-| `stageDir` | `%LOCALAPPDATA%\dsh-computer-use\bin` | helper/桩的暂存目录（须为 Medium 完整性级别） |
-| `codexHome` | `%LOCALAPPDATA%\dsh-computer-use\codex-home` | helper 的私有 CODEX_HOME（中断标记、缓存） |
-| `autoApprove` | `[]` | 免审批应用。大小写不敏感，接受 helper 报告的任意身份：app id、`process:<path>`、可执行文件名（`notepad` / `notepad.exe`）、AUMID 包前缀（`Microsoft.WindowsNotepad`）、含本地化的显示名（`记事本`）。Harness 自身永远不会被批准 |
-| `enforceBrowserUrlPolicy` | `false` | 为 `true` 时不再发送绕过 helper 浏览器 URL 策略的本地测试 meta |
+| `stageDir` | `%LOCALAPPDATA%\dsh-computer-use\bin` | 助手/桩的暂存目录（须为 Medium 完整性级别） |
+| `codexHome` | `%LOCALAPPDATA%\dsh-computer-use\codex-home` | 助手的私有 CODEX_HOME（中断标记、缓存） |
+| `autoApprove` | `[]` | 免审批应用。大小写不敏感，接受助手报告的任意身份：app id、`process:<path>`、可执行文件名（`notepad` / `notepad.exe`）、AUMID 包前缀（`Microsoft.WindowsNotepad`）、含本地化的显示名（`记事本`）。Harness 自身永远不会被批准 |
+| `enforceBrowserUrlPolicy` | `false` | 为 `true` 时不再发送绕过助手浏览器 URL 策略的本地测试 meta |
 | `timeoutMs` / `launchTimeoutMs` | `10000` / `15000` | 单请求 / 启动超时 |
 
 ## 安全模型
 
-- **逐应用审批（fail-closed）**：helper 首次触达某个应用时发出 `approvalRequest`，经 Harness 审批服务征询用户；没有审批服务或用户拒绝时一律拒绝。`allowed-once` 在同一 agent 会话内记住。
+- **逐应用审批（fail-closed）**：助手首次触达某个应用时发出 `approvalRequest`，经 Harness 审批服务征询用户；没有审批服务或用户拒绝时一律拒绝。`allowed-once` 在同一 agent 会话内记住。
 - **不可覆盖的自我排除**：任何输入类工具（点击/输入/按键/激活等）与审批层三重拒绝把 Harness 自己当作目标，`autoApprove` 也无法解锁。
-- **物理 Esc**：helper 以 130 退出并写入中断标记后，本回合内所有调用短路为「用户已停止电脑操作」；回合推进或标记被清理即自动恢复。
+- **物理 Esc**：助手以 130 退出并写入中断标记后，本回合内所有调用短路为「用户已停止电脑操作」；回合推进或标记被清理即自动恢复。
 - **坐标守卫**：坐标输入必须携带该窗口最新快照的 `screenshotId`；快照期被窗口级覆盖物压住的点直接拒绝（目标应用自己的小菜单不误伤）。任何输入送达后旧快照坐标即失效。
 - 桌面操作对模型可见的护栏只是护栏：请在人工可监督的前提下使用。
 
 ## 已知限制（实测）
 
-- 部分现代应用（UWP 记事本、Chrome 等）不向 helper 暴露 UIA 树 → 用截图 + 坐标/键盘驱动。
+- 部分现代应用不向助手暴露完整 UIA 树（视窗口状态而定）→ 用截图 + 坐标/键盘驱动。
 - `explorer.exe` 等共享系统进程的窗口报 `executable has multiple signatures`，无法寻址。
-- 经 UWP stub 启动应用（如系统 `notepad.exe`）可能返回「did not expose a targetable window」——应用其实已启动，去 `sky__list_windows` 找它的包身份窗口。
+- 锁屏会话期间截图返回权限错误并降级为无截图（与原版行为一致）。
 - 遮挡检测是尽力而为：只有当快照同时捕获到覆盖窗口时才能判定；输入前务必先 `sky__activate_window`。
+
+## 协议逆向依据
+
+`SKY_WINDOWS_PROTOCOL_SPEC.md` 记录了对原版 `codex-computer-use.exe`（Rust 原生二进制）的全部逆向证据：20 方法名单、审批流、中断标记、浏览器 URL 策略门禁、枚举身份、截图/输入语义及全部锚点地址。`engine/` 以该 spec 为行为基准，并通过与原版助手的 A/B 差分探针验证一致性。
 
 ## 免责声明
 
-非官方爱好者项目，与 OpenAI、DeepSeek 无关。`codex-computer-use.exe` 及其行为归上游所有；本仓库仅包含连接它的开源桥接代码。
+非官方爱好者项目，与 OpenAI、DeepSeek 无关。`engine/` 为本仓库原创代码；原版 `codex-computer-use.exe`（如你选择使用）及其行为归上游所有，请遵守上游许可与服务条款。

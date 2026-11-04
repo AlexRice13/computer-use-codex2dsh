@@ -1,4 +1,5 @@
 node_modules/
+/engine/target/
 *.log
 *.tmp
 tmp/

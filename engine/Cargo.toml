@@ -1,0 +1,58 @@
+[package]
+name = "sky-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Behavior-compatible open reimplementation of the Sky computer-use helper (codex-computer-use.exe)"
+license = "MIT"
+
+[[bin]]
+name = "sky-engine"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+windows-core = "0.61"
+uiautomation = "0.25"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Registry",
+    "Win32_System_Time",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_System_DataExchange",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Foundation_Collections",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+]
+
+[profile.release]
+opt-level = 2
+lto = "thin"

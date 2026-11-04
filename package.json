@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Standalone Windows computer-use provider for DeepSeek Harness: drives the host desktop through the Sky computer-use helper (codex-computer-use.exe) staged from a local OpenAI Codex/ChatGPT desktop install; no ChatGPT or Codex process involvement at runtime",
+  "description": "Standalone Windows computer-use provider for DeepSeek Harness: drives the host desktop through an open-source native reimplementation of the Sky computer-use helper; no ChatGPT or Codex app involvement at runtime",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

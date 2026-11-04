@@ -1,0 +1,61 @@
+use crate::policy::Policy;
+use std::collections::{HashMap, HashSet};
+
+/// A get_window_state snapshot kept per window so element_index actions
+/// resolve against the tree the model just saw (the helper owns this cache;
+/// a newer snapshot for the same window replaces it wholesale).
+#[allow(dead_code)] // metadata kept for diagnostics / future invalidation
+pub struct WindowSnapshot {
+    pub hwnd: isize,
+    pub taken_ms: u64,
+    /// Window origin when captured; tree rects are screen-space.
+    pub origin: (i32, i32),
+    pub elements: Vec<crate::win::uia::ElementRecord>,
+    /// Ids of screenshots handed out with this snapshot.
+    pub shot_ids: Vec<String>,
+}
+
+/// Process-wide helper state. The RPC channel is serialized, so this lives
+/// behind a single owner in serve().
+pub struct EngineState {
+    #[allow(dead_code)] // stub policy allows everything today; kept for parity
+    pub policy: Policy,
+    /// Session-scoped approved app identities (per-turn cleanup per
+    /// `end_turn`, matching the observed helper).
+    pub approved_apps: HashSet<String>,
+    /// Last turn key (`<session_id>\0<turn_id>`) seen on the wire.
+    pub last_turn_key: Option<String>,
+    /// Latest snapshot per window (element_index resolution source).
+    pub snapshots: HashMap<isize, WindowSnapshot>,
+    /// Monotonic counter bumped on every successful accessibility snapshot
+    /// (diagnostic_state: snapshotRevision/accessibilityRevision).
+    pub snapshot_revision: u64,
+    /// Reason the last capture attempt failed, cleared on success.
+    pub last_capture_invalidation: Option<String>,
+}
+
+impl EngineState {
+    pub fn new(policy: Policy) -> Self {
+        EngineState {
+            policy,
+            approved_apps: HashSet::new(),
+            last_turn_key: None,
+            snapshots: HashMap::new(),
+            snapshot_revision: 0,
+            last_capture_invalidation: None,
+        }
+    }
+}
+
+/// Response shapes accepted by the client (spec §A.4).
+pub enum Response {
+    Result(serde_json::Value),
+    Error(String),
+    #[allow(dead_code)] // approval path is dormant: stub policy = default_app_access allow
+    Approval {
+        app: String,
+        display_name: String,
+        risk_level: Option<String>,
+        allow_persistent_approval: bool,
+    },
+}
