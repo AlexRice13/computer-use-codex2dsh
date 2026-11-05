@@ -4,7 +4,7 @@
 // (dispatch calls execute() only after approval).
 
 use windows::core::{GUID, HSTRING, PCWSTR};
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Com::CoCreateInstance;
 use windows::Win32::UI::Shell::{IApplicationActivationManager, ShellExecuteW};
 
 const REQUIRES_ID: &str =
@@ -74,22 +74,129 @@ pub fn plan_owner(plan: &Plan) -> String {
     }
 }
 
-/// Start the planned app (post-approval).
-pub fn execute(plan: &Plan) -> Result<(), String> {
-    match plan {
-        Plan::Aumid(a) => activate_aumid(a),
-        Plan::ExePath(p) => start_exe(p),
+/// Start the planned app (post-approval). The original verifies the launch
+/// actually produced a targetable window: it waits after activation and
+/// fails with "launched app did not expose a targetable window: {owner}"
+/// when none appears (measured against the original helper).
+///
+/// Both launch channels run on a dedicated STA thread: the shell-side COM
+/// classes (ApplicationActivationManager) are STA-only and CoCreateInstance
+/// from our MTA serve thread fails with CO_E_CLASSSTRING (0x80040154),
+/// while the original (a C++ helper) activates them from an STA context.
+pub fn execute(plan: &Plan, budget_ms: u64) -> Result<(), String> {
+    let owner = plan_owner(plan);
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let plan2 = plan.clone();
+    std::thread::spawn(move || {
+        let r = unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let r = match &plan2 {
+                Plan::Aumid(a) => activate_aumid(a),
+                Plan::ExePath(p) => start_exe(p),
+            };
+            // Let shell COM complete its reentrant callbacks.
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            };
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_millis(400) {
+                let mut msg = MSG::default();
+                if PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            use windows::Win32::System::Com::CoUninitialize;
+            CoUninitialize();
+            r
+        };
+        let _ = tx.send(r);
+    });
+    rx.recv().map_err(|e| format!("launch thread: {e}"))??;
+    // Only the exe-path channel verifies a window: ActivateApplication
+    // returning S_OK is accepted verbatim (measured: the original answers
+    // OK for a packaged app whose window never appears), while ShellExecute
+    // — which can silently no-op — is verified against the window table
+    // (measured: System32\Notepad.exe -> "launched app did not expose a
+    // targetable window: process:C:\Windows\System32\Notepad.exe").
+    if let Plan::ExePath(_) = plan {
+        // Wait most of the request budget (measured: the original waits
+        // for the window under a cold packaged-app start). Reserve enough
+        // headroom so rpc never reports budget exhaustion.
+        let wait_ms = budget_ms.saturating_sub(3000).clamp(4000, 12000);
+        return wait_for_window(&owner, std::time::Duration::from_millis(wait_ms));
+    }
+    Ok(())
+}
+
+/// Poll the raw window table until a visible window owned by `owner`
+/// exists (a pre-existing window also satisfies it — relaunching a running
+/// app surfaces its window and must succeed). Uses the raw window table:
+/// packaged apps (Calculator) present an untitled window first, which the
+/// title filter in enumerate_top_level would drop.
+fn wait_for_window(owner: &str, timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // No visibility filter: packaged apps (Calculator) keep an
+        // invisible/splash top-level window that the original still counts
+        // as "a targetable window" (measured: OK while MainWindowHandle=0).
+        let found = crate::win::enumerate::debug_windows()
+            .into_iter()
+            .any(|(_, _, _, _, _, _, _, app)| {
+                app.as_ref()
+                    .map(|a| a.eq_ignore_ascii_case(owner))
+                    .unwrap_or(false)
+            });
+        if found {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("launched app did not expose a targetable window: {owner}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 
 fn activate_aumid(aumid: &str) -> Result<(), String> {
     unsafe {
-        let mgr: IApplicationActivationManager =
-            CoCreateInstance(&CLSID_AA_MANAGER, None, CLSCTX_INPROC_SERVER)
-                .map_err(|e| format!("activation manager: {e}"))?;
-        let id = HSTRING::from(aumid);
-        mgr.ActivateApplication(&id, None, windows::Win32::UI::Shell::AO_NONE)
-            .map_err(|e| format!("{REQUIRES_ID} ({e})"))?;
+        // Preferred channel: the shell activation server. INPROC_SERVER
+        // alone fails with CO_E_CLASSSTRING in stripped environments, so
+        // allow the out-of-process fallback too.
+        let via_com = CoCreateInstance::<_, IApplicationActivationManager>(
+            &CLSID_AA_MANAGER,
+            None,
+            windows::Win32::System::Com::CLSCTX_INPROC_SERVER
+                | windows::Win32::System::Com::CLSCTX_LOCAL_SERVER,
+        )
+        .map_err(|e| format!("activation manager: {e}"))
+        .and_then(|mgr| {
+            let id = HSTRING::from(aumid);
+            mgr.ActivateApplication(&id, None, windows::Win32::UI::Shell::AO_NONE)
+                .map(|_process_key| ())
+                .map_err(|e| format!("{REQUIRES_ID} ({e})"))
+        });
+        if via_com.is_ok() {
+            return via_com;
+        }
+        // Fallback: ask the shell to activate the AppsFolder verb. Behaves
+        // identically (activates/foregrounds the packaged app) and works
+        // where direct COM activation is blocked for the process token.
+        let verb_target = HSTRING::from("explorer.exe");
+        let p = HSTRING::from(format!("shell:AppsFolder\\{aumid}"));
+        let h = ShellExecuteW(
+            None,
+            PCWSTR::null(),
+            PCWSTR(verb_target.as_ptr()),
+            PCWSTR(p.as_ptr()),
+            PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+        if h.0 as isize <= 32 {
+            return via_com; // report the original COM error
+        }
         Ok(())
     }
 }

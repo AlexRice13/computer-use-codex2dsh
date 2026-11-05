@@ -329,6 +329,10 @@ fn resolve_and_approve(st: &mut EngineState, w: &WinRef) -> Result<Resolved, Res
     if let Some(b) = browser_policy_gate(st, &r.owner) {
         return Err(b);
     }
+    // Any touching action makes a previous snapshot stale: the original
+    // always re-renders the tree after input (a set_value followed by
+    // get_window_state must show the new value, not the cached one).
+    st.snapshots.remove(&(r.hwnd.0 as isize));
     Ok(r)
 }
 
@@ -760,8 +764,10 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 // Snapshot cache: replay the rendered tree while the window
                 // is unchanged (the original keeps the revision stable).
                 let key = hwnd.0 as isize;
+                let no_cache = std::env::var("SKY_NO_CACHE").is_ok();
                 let hit = st.snapshots.get(&key).and_then(|s| {
-                    if s.title == title
+                    if !no_cache
+                        && s.title == title
                         && s.origin == r.origin
                         && s.size == r.size
                         && !s.tree.is_empty()
@@ -872,7 +878,13 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             if let Some(a) = approval_required(st, &owner) {
                 return a;
             }
-            match crate::launch::execute(&plan) {
+            match crate::launch::execute(
+                &plan,
+                meta
+                    .get("x-oai-cua-request-budget-ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(15000),
+            ) {
                 Ok(()) => Response::Result(json!({})),
                 Err(e) => Response::Error(e),
             }
