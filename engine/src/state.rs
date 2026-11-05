@@ -21,6 +21,14 @@ pub struct WindowSnapshot {
     pub document_text: Option<String>,
     /// Window title when captured (cheap invalidation check).
     pub title: String,
+    /// Value of `EngineState::last_input_seq` when the tree was captured.
+    /// A snapshot is only replayable while it still equals the counter: any
+    /// input since then makes the rendered tree stale, so the next
+    /// `get_window_state` must re-walk (the original always re-renders after
+    /// input). Element_index actions keep using it regardless, which is what
+    /// the documented contract asks for — a delivered click must not throw
+    /// away the indexes the model is still working from.
+    pub at_seq: u64,
 }
 
 /// Process-wide helper state. The RPC channel is serialized, so this lives
@@ -48,6 +56,9 @@ pub struct EngineState {
     /// Set when a browser window tripped the URL policy gate; the rest of
     /// the turn is stopped until `end_turn`.
     pub browser_policy_stopped: bool,
+    /// Bumped by every window-touching action. Snapshots captured at an older
+    /// value are never replayed as a tree (see `WindowSnapshot::at_seq`).
+    pub last_input_seq: u64,
 }
 
 impl EngineState {
@@ -62,6 +73,7 @@ impl EngineState {
             last_capture_invalidation: None,
             last_window_identity: None,
             browser_policy_stopped: false,
+            last_input_seq: 0,
         }
     }
 }

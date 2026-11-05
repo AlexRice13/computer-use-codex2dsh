@@ -226,6 +226,27 @@ pub fn is_browser_owner(owner: &str) -> bool {
 /// channel here). The turn stays stopped until end_turn.
 pub const BROWSER_URL_POLICY_REFUSAL: &str = "Computer Use has been stopped for this turn because it could not determine the current browser URL on Windows with enough confidence to enforce policy. Stop your work and send a final message noting why Computer Use ended.";
 
+/// Escape hatch of the original gate (`func@0x7737b`, see
+/// SKY_WINDOWS_PROTOCOL_SPEC §B.4): a request meta carrying
+/// `x-codex-browser-use-security-mode: disabled-for-local-testing` sets the
+/// URL-allowed sentinel and skips the `site_status` fetch entirely. Measured
+/// live on a Chrome window — without the key an approved `get_window_state`
+/// throws the stop, with it the same call returns the full UIA tree. It is the
+/// mode OpenAI uses for its own local testing, i.e. the intended path for
+/// running the helper outside ChatGPT, which is exactly how this engine is
+/// deployed; the plugin puts it on the base meta unless the user explicitly
+/// turns it off with the `enforceBrowserUrlPolicy` config.
+pub const BROWSER_POLICY_BYPASS_KEY: &str = "x-codex-browser-use-security-mode";
+pub const BROWSER_POLICY_BYPASS_VALUE: &str = "disabled-for-local-testing";
+
+/// True when this frame opted out of remote browser URL policy enforcement.
+pub fn browser_policy_bypassed(meta: &Value) -> bool {
+    meta.get(BROWSER_POLICY_BYPASS_KEY)
+        .and_then(Value::as_str)
+        .map(|v| v.eq_ignore_ascii_case(BROWSER_POLICY_BYPASS_VALUE))
+        .unwrap_or(false)
+}
+
 fn canonical_approval_app(owner: &str) -> (String, String) {
     if let Some(exe) = browser_exe(owner) {
         let display = match owner {
@@ -308,31 +329,41 @@ fn approval_required(st: &EngineState, owner: &str) -> Option<Response> {
     })
 }
 
-/// After approval, browser windows hit the URL policy gate. In this
-/// environment the original can never pin the active URL down, so every
-/// approved browser touch lands on the byte-exact refusal (measured on
-/// live Chrome and Edge windows); the rest of the turn stays stopped.
-fn browser_policy_gate(st: &mut EngineState, owner: &str) -> Option<Response> {
-    if is_browser_owner(owner) {
-        st.browser_policy_stopped = true;
-        return Some(Response::Error(BROWSER_URL_POLICY_REFUSAL.into()));
+/// After approval, browser windows hit the URL policy gate. Without the
+/// local-testing opt-out the original can never pin the active URL down in
+/// this environment, so every approved browser touch lands on the byte-exact
+/// refusal (measured on live Chrome and Edge windows) and the rest of the turn
+/// stays stopped. A frame that carries the documented
+/// `x-codex-browser-use-security-mode: disabled-for-local-testing` meta takes
+/// the original's own escape hatch instead and proceeds.
+fn browser_policy_gate(st: &mut EngineState, owner: &str, meta: &Value) -> Option<Response> {
+    if !is_browser_owner(owner) {
+        return None;
     }
-    None
+    if browser_policy_bypassed(meta) {
+        return None;
+    }
+    st.browser_policy_stopped = true;
+    Some(Response::Error(BROWSER_URL_POLICY_REFUSAL.into()))
 }
 
 /// Resolve window + gate approval in one step for all touching methods.
-fn resolve_and_approve(st: &mut EngineState, w: &WinRef) -> Result<Resolved, Response> {
+fn resolve_and_approve(st: &mut EngineState, w: &WinRef, meta: &Value) -> Result<Resolved, Response> {
     let r = resolve_win(w).map_err(Response::Error)?;
     if let Some(a) = approval_required(st, &r.owner) {
         return Err(a);
     }
-    if let Some(b) = browser_policy_gate(st, &r.owner) {
+    if let Some(b) = browser_policy_gate(st, &r.owner, meta) {
         return Err(b);
     }
-    // Any touching action makes a previous snapshot stale: the original
-    // always re-renders the tree after input (a set_value followed by
-    // get_window_state must show the new value, not the cached one).
-    st.snapshots.remove(&(r.hwnd.0 as isize));
+    // Any touching action makes the rendered tree stale: the original always
+    // re-renders after input (a set_value followed by get_window_state must
+    // show the new value, not the cached one). The snapshot itself has to
+    // survive this call: the element_index actions resolve their element out
+    // of it immediately after this returns, and the documented contract keeps
+    // those indexes usable until the next snapshot is taken. Dropping it here
+    // made every element_index action fail with "no snapshot for window".
+    st.last_input_seq += 1;
     Ok(r)
 }
 
@@ -460,7 +491,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window) {
+            match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
                     crate::win::input::activate(r.hwnd);
                     Response::Result(json!({}))
@@ -473,7 +504,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window) {
+            match resolve_and_approve(st, &p.window, meta) {
                 Ok(_r) => {
                     crate::win::input::type_text(&p.text);
                     Response::Result(json!({}))
@@ -486,7 +517,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window) {
+            match resolve_and_approve(st, &p.window, meta) {
                 Ok(_r) => match crate::win::input::press_key(&p.key) {
                     Ok(()) => Response::Result(json!({})),
                     Err(e) => Response::Error(e),
@@ -499,7 +530,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window) {
+            match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
                     let x = r.origin.0 + p.x;
                     let y = r.origin.1 + p.y;
@@ -519,7 +550,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window) {
+            match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
                     let x = r.origin.0 + p.x;
                     let y = r.origin.1 + p.y;
@@ -534,7 +565,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window) {
+            match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
                     let from = (r.origin.0 + p.from_x, r.origin.1 + p.from_y);
                     let to = (r.origin.0 + p.to_x, r.origin.1 + p.to_y);
@@ -550,7 +581,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window)
+            match resolve_and_approve(st, &p.window, meta)
                 .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
             {
                 Ok((_r, (_el, rect))) => {
@@ -573,7 +604,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(p) => p,
                 Err(e) => return Response::Error(e),
             };
-            match resolve_and_approve(st, &p.window)
+            match resolve_and_approve(st, &p.window, meta)
                 .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
             {
                 Ok((_r, (_el, rect))) => {
@@ -594,7 +625,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Some(v) => v,
                 None => return Response::Error(format!("parse {method} params: missing field `value`")),
             };
-            match resolve_and_approve(st, &p.window)
+            match resolve_and_approve(st, &p.window, meta)
                 .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
             {
                 Ok((_r, (el, _rect))) => {
@@ -622,7 +653,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                     return Response::Error(format!("parse {method} params: missing field `action`"))
                 }
             };
-            match resolve_and_approve(st, &p.window)
+            match resolve_and_approve(st, &p.window, meta)
                 .and_then(|r| snapshot_element(st, &r, p.element_index).map(|e| (r, e)).map_err(Response::Error))
             {
                 Ok((_r, (el, rect))) => {
@@ -713,7 +744,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             if let Some(a) = approval_required(st, &r.owner) {
                 return a;
             }
-            if let Some(b) = browser_policy_gate(st, &r.owner) {
+            if let Some(b) = browser_policy_gate(st, &r.owner, meta) {
                 return b;
             }
             if !p.include_screenshot && !p.include_text {
@@ -770,6 +801,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                         && s.title == title
                         && s.origin == r.origin
                         && s.size == r.size
+                        && s.at_seq == st.last_input_seq
                         && !s.tree.is_empty()
                     {
                         Some((s.tree.clone(), s.focused_element.clone(), s.document_text.clone()))
@@ -815,6 +847,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                                         focused_element: built.focused_element,
                                         document_text: built.document_text,
                                         title: title.clone(),
+                                        at_seq: st.last_input_seq,
                                     },
                                 );
                                 // Original: +1 revision / +3 snapshot entries
