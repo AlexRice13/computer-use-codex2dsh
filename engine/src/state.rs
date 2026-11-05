@@ -45,6 +45,9 @@ pub struct EngineState {
     /// Identity of the last window a snapshot was taken of
     /// (diagnostic_state: lastWindowIdentity).
     pub last_window_identity: Option<serde_json::Value>,
+    /// Set when a browser window tripped the URL policy gate; the rest of
+    /// the turn is stopped until `end_turn`.
+    pub browser_policy_stopped: bool,
 }
 
 impl EngineState {
@@ -58,6 +61,7 @@ impl EngineState {
             snapshot_count: 0,
             last_capture_invalidation: None,
             last_window_identity: None,
+            browser_policy_stopped: false,
         }
     }
 }

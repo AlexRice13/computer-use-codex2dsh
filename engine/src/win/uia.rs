@@ -105,6 +105,19 @@ mod uia_bindings {
     pub struct Keepalive(#[allow(dead_code)] pub HandlerIfc);
     // SAFETY: interface pointer to an apartment-agnostic COM object.
     unsafe impl Send for Keepalive {}
+
+    // oleacc MSAA probe: Chromium switches on its full accessibility tree
+    // only when an MSAA client asks for the render-widget's IAccessible
+    // (the original's imports include oleacc.dll).
+    #[link(name = "oleacc")]
+    extern "system" {
+        pub fn AccessibleObjectFromWindow(
+            hwnd: windows::Win32::Foundation::HWND,
+            id: u32,
+            iid: *const windows::core::GUID,
+            obj: *mut *mut core::ffi::c_void,
+        ) -> windows::core::HRESULT;
+    }
 }
 
 fn wake_provider(hwnd: HWND) {
@@ -130,6 +143,29 @@ fn wake_provider(hwnd: HWND) {
         let Ok(root) = uia.ElementFromHandle(hwnd) else {
             return;
         };
+        // MSAA wake-up: Chromium enables its full accessibility tree when
+        // an MSAA client requests the render widget's IAccessible. Ask the
+        // content host window (Chrome_RenderWidgetHostHWND) and the frame
+        // itself; the returned interface is intentionally parked.
+        let probe = |target: windows::Win32::Foundation::HWND, tag: &str| unsafe {
+            use windows::core::GUID;
+            let iid = GUID::from_u128(0x61873670_DF8D_11D0_899A_00A0C90557AC);
+            let mut obj: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hr = uia_bindings::AccessibleObjectFromWindow(target, 0xFFFF_FFFC, &iid, &mut obj);
+            dbg_log(&format!("[msaa-wake] {tag} hr={hr:?} obj={}", !obj.is_null()));
+        };
+        {
+            use windows::core::PCWSTR;
+            use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
+            let cls: Vec<u16> = "Chrome_RenderWidgetHostHWND".encode_utf16().chain(std::iter::once(0)).collect();
+            probe(hwnd, "frame");
+            if let Ok(child) = unsafe { FindWindowExW(Some(hwnd), None, PCWSTR(cls.as_ptr()), PCWSTR::null()) } {
+                probe(child, "render-widget");
+            } else {
+                dbg_log("[msaa-wake] no render-widget child");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
         let handler: IUIAutomationStructureChangedEventHandler = NopStructureHandler.into();
         match uia.AddStructureChangedEventHandler(&root, TreeScope_Subtree, None, &handler) {
             Ok(()) => {
@@ -139,6 +175,15 @@ fn wake_provider(hwnd: HWND) {
                 }
                 // Give the UIA core a beat to bring the provider up.
                 std::thread::sleep(std::time::Duration::from_millis(250));
+                // Diagnostic: does THIS (subscribed, warm) instance see the
+                // full subtree via FindAll while a fresh crate instance sees
+                // only 3 nodes? Answers whether tree cache is per-instance.
+                if let Ok(cond) = uia.CreateTrueCondition() {
+                    match root.FindAll(TreeScope_Subtree, &cond) {
+                        Ok(els) => dbg_log(&format!("[wake-findall] hwnd={hwnd:?} count={}", els.Length().unwrap_or(-1))),
+                        Err(e) => dbg_log(&format!("[wake-findall-err] hwnd={hwnd:?} {e}")),
+                    }
+                }
             }
             Err(e) => dbg_log(&format!("[wake-fail] hwnd={hwnd:?} {e}")),
         }

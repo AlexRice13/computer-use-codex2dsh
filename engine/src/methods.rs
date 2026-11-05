@@ -201,9 +201,41 @@ fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
 // are not gated. Canonical identity shapes (observed):
 //   process windows -> lowercase file name ("deepseek harness.exe")
 //   packaged apps   -> the AUMID verbatim
+//   browsers        -> lowercase exe file name + riskLevel "high"
 // ---------------------------------------------------------------------------
 
+/// Chromium-family product tokens produced by identity::app_id_for_window.
+pub fn browser_exe(owner: &str) -> Option<&'static str> {
+    match owner {
+        "Chrome" => Some("chrome.exe"),
+        "MSEdge" => Some("msedge.exe"),
+        "Brave" => Some("brave.exe"),
+        "Opera" => Some("opera.exe"),
+        _ => None,
+    }
+}
+
+/// True when the resolved owner is a whitelisted browser window.
+pub fn is_browser_owner(owner: &str) -> bool {
+    browser_exe(owner).is_some()
+}
+
+/// Byte-exact refusal the original emits whenever it cannot pin down the
+/// active URL of a browser window (measured: every browser touch in this
+/// environment ends up on this branch — the original has no reliable URL
+/// channel here). The turn stays stopped until end_turn.
+pub const BROWSER_URL_POLICY_REFUSAL: &str = "Computer Use has been stopped for this turn because it could not determine the current browser URL on Windows with enough confidence to enforce policy. Stop your work and send a final message noting why Computer Use ended.";
+
 fn canonical_approval_app(owner: &str) -> (String, String) {
+    if let Some(exe) = browser_exe(owner) {
+        let display = match owner {
+            "Chrome" => "Google Chrome",
+            "MSEdge" => "Microsoft Edge",
+            "Brave" => "Brave Browser",
+            _ => "Opera",
+        };
+        return (exe.to_string(), display.to_string());
+    }
     if let Some(path) = owner
         .strip_prefix("process:")
         .or_else(|| owner.strip_prefix("process:\\"))
@@ -267,19 +299,35 @@ fn approval_required(st: &EngineState, owner: &str) -> Option<Response> {
     if st.approved_apps.contains(&app_key.to_lowercase()) {
         return None;
     }
+    let risk = if is_browser_owner(owner) { "high" } else { "low" };
     Some(Response::Approval {
         app: app_key,
         display_name,
-        risk_level: Some("low".into()),
+        risk_level: Some(risk.into()),
         allow_persistent_approval: true,
     })
 }
 
+/// After approval, browser windows hit the URL policy gate. In this
+/// environment the original can never pin the active URL down, so every
+/// approved browser touch lands on the byte-exact refusal (measured on
+/// live Chrome and Edge windows); the rest of the turn stays stopped.
+fn browser_policy_gate(st: &mut EngineState, owner: &str) -> Option<Response> {
+    if is_browser_owner(owner) {
+        st.browser_policy_stopped = true;
+        return Some(Response::Error(BROWSER_URL_POLICY_REFUSAL.into()));
+    }
+    None
+}
+
 /// Resolve window + gate approval in one step for all touching methods.
-fn resolve_and_approve(st: &EngineState, w: &WinRef) -> Result<Resolved, Response> {
+fn resolve_and_approve(st: &mut EngineState, w: &WinRef) -> Result<Resolved, Response> {
     let r = resolve_win(w).map_err(Response::Error)?;
     if let Some(a) = approval_required(st, &r.owner) {
         return Err(a);
+    }
+    if let Some(b) = browser_policy_gate(st, &r.owner) {
+        return Err(b);
     }
     Ok(r)
 }
@@ -317,11 +365,19 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
         st.approved_apps.insert(app);
     }
 
+    // Once the browser URL policy has stopped the turn, every touching
+    // method keeps answering with the same refusal until end_turn.
+    const TURN_SAFE: [&str; 6] = ["close", "end_turn", "diagnostic_state", "list_apps", "list_windows", "get_window"];
+    if st.browser_policy_stopped && !TURN_SAFE.contains(&method) {
+        return Response::Error(BROWSER_URL_POLICY_REFUSAL.into());
+    }
+
     match method {
         "close" => Response::Result(json!({})),
         "end_turn" => {
             st.last_turn_key = None;
             st.approved_apps.clear();
+            st.browser_policy_stopped = false;
             Response::Result(json!({}))
         }
         "diagnostic_state" => Response::Result(json!({
@@ -652,6 +708,9 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             // answers both-false with the window echo even while iconic).
             if let Some(a) = approval_required(st, &r.owner) {
                 return a;
+            }
+            if let Some(b) = browser_policy_gate(st, &r.owner) {
+                return b;
             }
             if !p.include_screenshot && !p.include_text {
                 return Response::Error(
