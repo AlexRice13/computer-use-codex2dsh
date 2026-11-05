@@ -224,7 +224,34 @@ pub fn app_id_for_window(hwnd: HWND, pid: u32) -> Option<String> {
         return Some(aumid);
     }
     let path = process_image_path(pid)?;
+    let name = path.rsplit('\\').next().unwrap_or("").to_lowercase();
+    // Chromium-family browsers are identified by product token, not path
+    // (measured: Chrome window app = "Chrome", Edge window app = "MSEdge").
+    // The whitelist order (chrome/msedge/brave/opera) matches the original
+    // binary's embedded exe list.
+    match name.as_str() {
+        "chrome.exe" => return Some("Chrome".into()),
+        "msedge.exe" => return Some("MSEdge".into()),
+        "brave.exe" => return Some("Brave".into()),
+        "opera.exe" => return Some("Opera".into()),
+        _ => {}
+    }
     if path.to_lowercase().contains("\\windowsapps\\") {
+        // Packaged (UWP/WinUI3) app window: derive the AUMID from the
+        // process's package identity (measured: modern Notepad windows are
+        // reported by the original as their AUMID even when the window has
+        // no shell AUMID property).
+        if let Some(full) = package_full_name_for_pid(pid) {
+            // Terminal-family windows are excluded on purpose (the original
+            // names the WindowsTerminal AUMID next to its terminal-token
+            // list: conhost/fluentterminal/git-bash/hyperkit/wsl/wt).
+            if full.to_lowercase().starts_with("microsoft.windowsterminal_") {
+                return None;
+            }
+            if let Some(a) = aumid_from_package_full_name(&full) {
+                return Some(a);
+            }
+        }
         return None;
     }
     if is_excluded_host_process(&path) {

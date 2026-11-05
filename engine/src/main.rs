@@ -116,6 +116,21 @@ fn main() -> ExitCode {
         );
     }
     harden_env();
+    // Private debug modes (not part of the RPC contract).
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some("--wins") {
+            for (hwnd, pid, class, title, visible, cloaked, tool, app) in win::enumerate::debug_windows() {
+                if title.trim().is_empty() && !class.contains("Notepad") && !class.contains("Content") {
+                    continue;
+                }
+                println!(
+                    "{hwnd} pid={pid} vis={visible} cloak={cloaked} tool={tool} class={class:?} title={title:?} app={app:?}"
+                );
+            }
+            return ExitCode::SUCCESS;
+        }
+    }
     // Private debug mode (not part of the RPC contract): capture one frame.
     {
         let argv: Vec<String> = std::env::args().collect();

@@ -126,3 +126,37 @@ pub fn enumerate_top_level() -> Vec<WindowRecord> {
     }
     out
 }
+
+/// Debug-only (--wins): every raw EnumWindows entry with its filter fields
+/// and identity resolution, for diagnosing enumeration divergences.
+pub fn debug_windows() -> Vec<(isize, u32, String, String, bool, bool, bool, Option<String>)> {
+    let _com = ComGuard::new();
+    unsafe extern "system" fn cb(hwnd: windows::Win32::Foundation::HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<RawWin>);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let mut cls = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut cls);
+        let class = if n > 0 { String::from_utf16_lossy(&cls[..n as usize]) } else { String::new() };
+        out.push(RawWin {
+            hwnd,
+            pid,
+            class,
+            title: identity::window_title(hwnd),
+            visible: IsWindowVisible(hwnd).as_bool(),
+            cloaked: identity::is_cloaked(hwnd),
+            toolwindow: (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize) != 0,
+        });
+        true.into()
+    }
+    let mut raw: Vec<RawWin> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut raw as *mut _ as isize));
+    }
+    raw.into_iter()
+        .map(|w| {
+            let app = identity::app_id_for_window(w.hwnd, w.pid);
+            (w.hwnd.0 as isize, w.pid, w.class, w.title, w.visible, w.cloaked, w.toolwindow, app)
+        })
+        .collect()
+}
