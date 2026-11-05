@@ -50,6 +50,7 @@ features = [
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",
     "Foundation_Collections",
+    "Security_Authorization_AppCapabilityAccess",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",

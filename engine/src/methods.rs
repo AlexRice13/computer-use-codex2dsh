@@ -147,6 +147,28 @@ struct Resolved {
     size: (i32, i32),
     owner: String,
     pid: u32,
+    /// DPI scale of this window (`GetDpiForWindow` / 96). Snapshot coordinates
+    /// are logical pixels (the screenshot the model measures on is the window
+    /// in logical px, matching the original), so they reach the screen through
+    /// this factor.
+    scale: f64,
+}
+
+/// Screen-space point for a snapshot-relative coordinate.
+///
+/// A snapshot pixel belongs to the screenshot's rectangle: the window's
+/// extended frame in logical pixels. The physical target is therefore the
+/// physical extended-frame origin plus the pixel scaled by the window DPI.
+/// Feeding the logical pixel straight into the physical origin (the old
+/// behaviour) landed every click short of the target by a factor of the scale
+/// — measured at 200%: snapshot (600,400) arrived at screen (621,821) physical
+/// instead of (1231,820).
+fn to_screen(r: &Resolved, x: i32, y: i32) -> (i32, i32) {
+    let s = if r.scale.is_finite() && r.scale > 0.0 { r.scale } else { 1.0 };
+    (
+        r.origin.0 + (x as f64 * s).round() as i32,
+        r.origin.1 + (y as f64 * s).round() as i32,
+    )
 }
 
 fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
@@ -185,12 +207,30 @@ fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut rect);
     }
+    // Anchor on the visible frame. DWM's extended bounds exclude the invisible
+    // resize border that GetWindowRect still reports, and the screenshot covers
+    // exactly this rectangle, so it is the anchor snapshot pixels must use.
+    let mut ext = RECT::default();
+    let origin = match unsafe {
+        windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut ext as *mut RECT as *mut core::ffi::c_void,
+            core::mem::size_of::<RECT>() as u32,
+        )
+    } {
+        Ok(()) if ext.right > ext.left && ext.bottom > ext.top => (ext.left, ext.top),
+        _ => (rect.left, rect.top),
+    };
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    let scale = (dpi as f64 / 96.0).max(0.25);
     Ok(Resolved {
         hwnd,
-        origin: (rect.left, rect.top),
+        origin,
         size: (rect.right - rect.left, rect.bottom - rect.top),
         owner,
         pid,
+        scale,
     })
 }
 
@@ -532,8 +572,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
-                    let x = r.origin.0 + p.x;
-                    let y = r.origin.1 + p.y;
+                    let (x, y) = to_screen(&r, p.x, p.y);
                     let button = match p.mouse_button.as_deref() {
                         Some("right") => crate::win::input::Button::Right,
                         Some("middle") => crate::win::input::Button::Middle,
@@ -552,8 +591,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
-                    let x = r.origin.0 + p.x;
-                    let y = r.origin.1 + p.y;
+                    let (x, y) = to_screen(&r, p.x, p.y);
                     crate::win::input::wheel(x, y, p.scroll_x as i32, p.scroll_y as i32);
                     Response::Result(json!({}))
                 }
@@ -567,8 +605,8 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
-                    let from = (r.origin.0 + p.from_x, r.origin.1 + p.from_y);
-                    let to = (r.origin.0 + p.to_x, r.origin.1 + p.to_y);
+                    let from = to_screen(&r, p.from_x, p.from_y);
+                    let to = to_screen(&r, p.to_x, p.to_y);
                     crate::win::input::drag(from, to);
                     Response::Result(json!({}))
                 }
@@ -767,25 +805,35 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             });
 
             if p.include_screenshot {
-                match crate::win::capture::capture_window_jpeg(hwnd) {
-                    Ok((jpeg, w, h)) => {
+                match crate::win::capture::capture_window_jpeg_ex(hwnd) {
+                    Ok((jpeg, w, h, origin_x, origin_y)) => {
                         st.last_capture_invalidation = None;
                         use base64::Engine as _;
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                        // Field set, ids and geometry mirror the original's
+                        // screenshot records exactly: `id` "screenshot-<n>",
+                        // the window's screen origin in logical px, no
+                        // `hasContent` (the original never emits it).
                         result["screenshots"] = json!([{
-                            "id": "shot-1",
+                            "id": "screenshot-0",
                             "url": format!("data:image/jpeg;base64,{b64}"),
-                            "originX": 0,
-                            "originY": 0,
+                            "originX": origin_x,
+                            "originY": origin_y,
                             "width": w,
                             "height": h,
                             "zIndex": 0,
-                            "hasContent": true,
                         }]);
                     }
-                    // Uncapturable (locked session, protected window):
-                    // degrade to no screenshots like the original.
+                    // Capture failed (e.g. the Windows screen-recording
+                    // consent gate denies this exe path, a locked session, or
+                    // a protected window). The original helper fails the whole
+                    // call in that case; we keep the accessibility tree but
+                    // must not let the failure vanish — storing it only in
+                    // `last_capture_invalidation` (which `diagnostic_state`
+                    // never exposes) is what made an engine-wide capture
+                    // failure look like "this window has no screenshot".
                     Err(e) => {
+                        result["screenshotError"] = json!(e);
                         st.last_capture_invalidation = Some(e);
                     }
                 }
