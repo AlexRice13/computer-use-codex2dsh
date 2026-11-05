@@ -39,7 +39,12 @@ pub struct BuiltTree {
     pub document_text: Option<String>,
 }
 
-const MAX_ELEMENTS: usize = 600;
+/// Cap on walked elements. 600 used to cut real pages off: the commit list of
+/// a busy repository measured 868 nodes through the reference client, and the
+/// walk stopped at exactly index 599. 2000 is above the largest tree observed
+/// anywhere, so the limit no longer decides what the model gets to see;
+/// TREE_BUDGET_MS remains the guard against pathological pages.
+const MAX_ELEMENTS: usize = 2000;
 const MAX_DEPTH: usize = 64;
 const TREE_BUDGET_MS: u128 = 6500;
 
