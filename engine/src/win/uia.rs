@@ -69,16 +69,21 @@ fn one_line(s: &str) -> String {
         .to_string()
 }
 
-// Wake a potentially suspended UIA provider: subscribing a live
-// structure-changed event handler forces the UIA core to bring the
-// provider connection up, after which even a suspended Chromium exposes
-// its full subtree (matches the original helper's observed behaviour).
+// Wake a potentially suspended UIA provider: the original helper is proven
+// (ETW: IRawElementProviderAdviseEvents::AdviseEventAdded(20005) x360 during
+// its first request) to hold live focus-changed + structure-changed event
+// advices, which make the UIA core negotiate event-enabled connections with
+// every provider it connects to. We subscribe the same pair (process-wide
+// AutomationFocusChanged 20005 + subtree StructureChanged) and then let the
+// tree walk run against a growth-stable retry loop so the Chromium provider
+// has its settle window inside the same request budget.
 #[allow(non_camel_case_types)]
 mod uia_bindings {
     use windows::core::{implement, Ref as WinRef, Result as WinResult};
     use windows::Win32::System::Com::SAFEARRAY;
     use windows::Win32::UI::Accessibility::{
-        IUIAutomationElement, IUIAutomationStructureChangedEventHandler,
+        IUIAutomationElement, IUIAutomationFocusChangedEventHandler,
+        IUIAutomationFocusChangedEventHandler_Impl, IUIAutomationStructureChangedEventHandler,
         IUIAutomationStructureChangedEventHandler_Impl, StructureChangeType,
     };
 
@@ -97,6 +102,19 @@ mod uia_bindings {
         }
     }
 
+    #[derive(Default)]
+    #[implement(IUIAutomationFocusChangedEventHandler)]
+    pub struct NopFocusHandler;
+
+    impl IUIAutomationFocusChangedEventHandler_Impl for NopFocusHandler_Impl {
+        fn HandleFocusChangedEvent(
+            &self,
+            _sender: WinRef<'_, IUIAutomationElement>,
+        ) -> WinResult<()> {
+            Ok(())
+        }
+    }
+
     pub use windows::Win32::UI::Accessibility::IUIAutomationStructureChangedEventHandler as HandlerIfc;
 
     /// The UIA core keeps calling into the handler from its own threads;
@@ -105,24 +123,31 @@ mod uia_bindings {
     pub struct Keepalive(#[allow(dead_code)] pub HandlerIfc);
     // SAFETY: interface pointer to an apartment-agnostic COM object.
     unsafe impl Send for Keepalive {}
+
+    pub struct FocusKeepalive(#[allow(dead_code)] pub IUIAutomationFocusChangedEventHandler);
+    // SAFETY: interface pointer to an apartment-agnostic COM object.
+    unsafe impl Send for FocusKeepalive {}
 }
 
 fn wake_provider(hwnd: HWND) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    use uia_bindings::{Keepalive, NopStructureHandler};
+    use uia_bindings::{FocusKeepalive, Keepalive, NopFocusHandler, NopStructureHandler};
     static KEEP: OnceLock<Mutex<(HashSet<isize>, Vec<Keepalive>)>> = OnceLock::new();
+    static FOCUS_KEEP: OnceLock<Mutex<Option<FocusKeepalive>>> = OnceLock::new();
     let keep = KEEP.get_or_init(|| Mutex::new((HashSet::new(), Vec::new())));
-    if let Ok(g) = keep.lock() {
-        if g.0.contains(&(hwnd.0 as isize)) {
-            return; // already subscribed for this window
-        }
+    let already_waked = keep
+        .lock()
+        .map(|g| g.0.contains(&(hwnd.0 as isize)))
+        .unwrap_or(false);
+    if already_waked {
+        return; // already subscribed for this window
     }
     unsafe {
         use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
         use windows::Win32::UI::Accessibility::{
-            CUIAutomation, IUIAutomation, IUIAutomationStructureChangedEventHandler,
-            TreeScope_Subtree,
+            CUIAutomation, IUIAutomation, IUIAutomationFocusChangedEventHandler,
+            IUIAutomationStructureChangedEventHandler, TreeScope_Subtree,
         };
         let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) else {
             return;
@@ -130,6 +155,22 @@ fn wake_provider(hwnd: HWND) {
         let Ok(root) = uia.ElementFromHandle(hwnd) else {
             return;
         };
+        // AutomationFocusChangedEvent (20005) advice — the event the
+        // original's providers are demonstrably advised with (ETW:
+        // AdviseEventAdded(20005) x360). Process-wide focus advice is the
+        // only shape the COM client API offers; it is opt-in via
+        // SKY_WAKE_FOCUS=1 while we verify it cannot regress other
+        // Chromium windows' cached trees on this connection.
+        if std::env::var("SKY_WAKE_FOCUS").is_ok() {
+            if let Ok(mut g) = FOCUS_KEEP.get_or_init(|| Mutex::new(None)).lock() {
+                if g.is_none() {
+                    let fh: IUIAutomationFocusChangedEventHandler = NopFocusHandler.into();
+                    if uia.AddFocusChangedEventHandler(None, &fh).is_ok() {
+                        *g = Some(FocusKeepalive(fh));
+                    }
+                }
+            }
+        }
         let handler: IUIAutomationStructureChangedEventHandler = NopStructureHandler.into();
         match uia.AddStructureChangedEventHandler(&root, TreeScope_Subtree, None, &handler) {
             Ok(()) => {
@@ -137,12 +178,59 @@ fn wake_provider(hwnd: HWND) {
                     g.0.insert(hwnd.0 as isize);
                     g.1.push(Keepalive(handler));
                 }
-                // Give the UIA core a beat to bring the provider up.
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                // Let the event negotiation run: pump this thread's messages
+                // briefly (the original's event thread always pumps).
+                pump_messages(60);
             }
             Err(e) => dbg_log(&format!("[wake-fail] hwnd={hwnd:?} {e}")),
         }
     }
+}
+
+/// Dispatch and drop this thread's pending messages for up to `ms`
+/// milliseconds. UIA core completes parts of the client event registration
+/// through the subscribing thread's message queue; without pumping, provider
+/// advises stall (measured: AdviseEventAdded never fires).
+fn pump_messages(ms: u64) {
+    let t0 = now_ms();
+    while (now_ms() - t0) < ms {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, MSG, PM_REMOVE,
+            };
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = DispatchMessageW(&msg);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// True for Chromium-family windows (Chrome/Edge/Electron all use
+/// Chrome_WidgetWin_* top-level classes). Only these need the wake retry:
+/// their out-of-process UIA provider answers lazily, while Win32/WinUI
+/// providers are synchronous and must not pay the retry latency.
+fn is_chromium(hwnd: HWND) -> bool {
+    let mut buf = [0u16; 256];
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        let n = GetClassNameW(hwnd, &mut buf).max(0) as usize;
+        let cls = String::from_utf16_lossy(&buf[..n.min(255)]);
+        cls.starts_with("Chrome_") || cls.starts_with("Mozilla_")
+    }
+}
+
+/// Elements at or below this count mean the Chromium provider has not
+/// answered yet (measured stub trees are 3-4 elements).
+const STUB_MAX: usize = 12;
+const RETRY_INTERVAL_MS: u64 = 90;
+
+struct Snapshot {
+    elements: Vec<ElementRecord>,
+    lines: Vec<String>,
+    last_document: Option<String>,
+    title: String,
 }
 
 /// Build the accessibility tree for `hwnd`. `app_name` renders the header
@@ -170,42 +258,74 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
         .map_err(|e| format!("walker: {e}"))?;
 
     let started = now_ms();
-    let mut elements: Vec<ElementRecord> = Vec::new();
-    let mut lines: Vec<String> = Vec::new();
-    let mut last_document: Option<String> = None;
+    let mut snapshot = walk_snapshot(&walker, &root, started);
 
-    walk(
-        &walker,
-        &root,
-        0,
-        started,
-        &mut elements,
-        &mut lines,
-        &mut last_document,
-    );
+    // Chromium wake settle: the first walk after the event advise often
+    // still sees the synthesized stub tree. Re-walk (pumping messages in
+    // between, which lets the provider advises complete) until the tree
+    // has grown past the stub size and stops growing — bounded by the
+    // overall TREE_BUDGET_MS so we stay far under the 10s request budget.
+    // OPT-IN for now (SKY_WAKE_RETRY=1). While the raw-COM client cannot wake
+    // Chromium at all on this machine, the loop buys nothing and is pure
+    // latency: Chrome first request measured 4 lines/3 nodes in 1653 ms with
+    // it, and the same 4 lines/3 nodes in 89 ms without it, while the original
+    // helper served 868 nodes in ~450 ms in the same run. The loop stays
+    // because it is the right shape for the moment the wake does land; it must
+    // not cost 1.5 s per request while unproven.
+    if snapshot.elements.len() <= STUB_MAX
+        && is_chromium(hwnd)
+        && std::env::var("SKY_WAKE_RETRY").map(|v| v == "1").unwrap_or(false)
+    {
+        // Bounded wake window: the original's cold first request takes
+        // ~400-550 ms, so a ~1.25 s settle window covers late provider
+        // activation without letting an unwakeable provider stall the
+        // request. TREE_BUDGET_MS remains the absolute cap.
+        let deadline = (started + 1500).min(started + TREE_BUDGET_MS as u64 - 250);
+        let mut last = snapshot.elements.len();
+        let mut rounds = 0u32;
+        while now_ms() < deadline {
+            pump_messages(RETRY_INTERVAL_MS);
+            rounds += 1;
+            let next = walk_snapshot(&walker, &root, started);
+            let n = next.elements.len();
+            snapshot = next;
+            if n > STUB_MAX && n == last {
+                break; // grown and stable
+            }
+            if n > last {
+                last = n;
+            }
+        }
+        dbg_log(&format!(
+            "[wake-retry] hwnd={hwnd:?} rounds={rounds} elements={}",
+            snapshot.elements.len()
+        ));
+    }
 
-    // Header line: title from the root element's Name.
-    let title = one_line(&root.get_name().unwrap_or_default());
-    let mut out_lines = vec![format!("Window: \"{title}\", App: {app_name}.")];
+    let mut out_lines = vec![format!("Window: \"{}\", App: {app_name}.", snapshot.title)];
+    let mut lines = snapshot.lines;
     out_lines.append(&mut lines);
     let tree = out_lines.join("\n");
 
     // Focused element: rendered as its tree line when inside this subtree.
     let focused_element = uia.get_focused_element().ok().and_then(|f| {
         let fid = f.get_runtime_id().ok()?;
-        elements.iter().position(|r| {
-            r.element
-                .get_runtime_id()
-                .map(|id| id == fid)
-                .unwrap_or(false)
-        })
+        snapshot
+            .elements
+            .iter()
+            .position(|r| {
+                r.element
+                    .get_runtime_id()
+                    .map(|id| id == fid)
+                    .unwrap_or(false)
+            })
     }).and_then(|i| out_lines.get(i + 1).cloned()); // +1: skip header line
 
     let built = BuiltTree {
         tree,
-        elements,
+        elements: snapshot.elements,
         focused_element,
-        document_text: last_document,
+        document_text: snapshot.last_document,
     };
     dbg_log(&format!(
         "[ok] hwnd={hwnd:?} elements={} tree_len={} ms={}",
@@ -214,6 +334,32 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
         now_ms() - started
     ));
     Ok(built)
+}
+
+fn walk_snapshot(
+    walker: &uiautomation::core::UITreeWalker,
+    root: &UIElement,
+    started: u64,
+) -> Snapshot {
+    let mut elements: Vec<ElementRecord> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut last_document: Option<String> = None;
+    walk(
+        walker,
+        root,
+        0,
+        started,
+        &mut elements,
+        &mut lines,
+        &mut last_document,
+    );
+    let title = one_line(&root.get_name().unwrap_or_default());
+    Snapshot {
+        elements,
+        lines,
+        last_document,
+        title,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
