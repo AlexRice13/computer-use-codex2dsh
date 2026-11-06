@@ -1,14 +1,15 @@
 # computer-use-codex2dsh
 
-> Give [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) full Windows desktop control: 13 `sky__*` tools backed by an **open-source native reimplementation** of the Sky computer-use helper — no ChatGPT/Codex installation required at runtime.
+> Give [DeepSeek Harness](https://github.com/deepseek-ai) (DSH) full Windows desktop control: 14 `sky__*` tools backed by an **open-source native reimplementation** of the Sky computer-use helper — no ChatGPT/Codex installation required at runtime.
 
 `computer-use-codex2dsh` 是一个独立的 Windows「电脑操作」Cordis 插件：它把开源原生引擎 `sky-engine`（`engine/`，Rust，逆向复刻 Sky `codex-computer-use.exe` 的 stdio JSON-RPC 契约）接到 DeepSeek Harness 上，让模型可以直接查看窗口、点击、打字、滚动、拖拽。插件自身是一个纯 Node.js 的 stdio JSON-RPC 客户端/监管者——**运行时不连接 ChatGPT/Codex 的任何服务，不读取任何账号数据，不使用网络**。
 
 ## 它做什么
 
-- 向 Harness 注册 13 个 `sky__*` 桌面工具（见下表），独占 `computerUse` 注册槽位。
+- 向 Harness 注册 14 个 `sky__*` 桌面工具（见下表），独占 `computerUse` 注册槽位。
 - 首次调用时把 `sky-engine` 与一个本地 `app-server` 桩进程暂存到 `%LOCALAPPDATA%\dsh-computer-use\bin`，以 `--parent-pid` 方式启动并监管；卸载插件时干净回收进程。
-- 结果经 MCP 适配器投影：截图作为图像附件、UIA 树带元素索引；插件层补充了新鲜快照校验、遮挡启发式拒绝、自我排除等守卫。
+- 结果经 MCP 适配器投影：截图作为图像附件、UIA 树带元素索引和窗口相对包围盒；插件层补充了新鲜快照校验、遮挡启发式拒绝、自我排除等守卫。
+- 截图支持 `scale` 缩放与 `region` 局部裁剪（省 token），在缩小/裁剪后的图上量出的坐标仍可直接用于点击、拖拽、滚动；同一快照内的一串动作可以用 `sky__batch` 一次发完。
 
 ## 引擎：`engine/`（sky-rs）
 
@@ -38,10 +39,11 @@ helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
 | 工具 | 说明 |
 |------|------|
 | `sky__list_apps` / `sky__list_windows` / `sky__get_window` | 枚举应用与窗口，解析窗口句柄 `{app, id}` |
-| `sky__get_window_state` | 一次调用同时取 JPEG 截图与 UIA 可访问性树（元素索引仅对该快照有效） |
+| `sky__get_window_state` | 一次调用同时取 JPEG 截图与 UIA 可访问性树（元素索引仅对该快照有效）。可选 `scale`（0.1–1，缩放截图）与 `region {x,y,width,height}`（逻辑窗口坐标裁剪）；树行尾附窗口相对包围盒 `@x,y WxH` |
 | `sky__activate_window` | 置前窗口（任何输入前的必要动作——输入发往前台窗口） |
 | `sky__click` | 元素索引点击（首选）或快照坐标点击（必须携带 `screenshotId`） |
-| `sky__drag` / `sky__scroll` | 快照坐标拖拽 / 滚动（必须携带 `screenshotId`） |
+| `sky__drag` / `sky__scroll` | 快照坐标拖拽 / 滚动（必须携带 `screenshotId`）；拖拽按距离插值并在落点停留后显式抬起，长距离手势可正常提交 |
+| `sky__batch` | 一次调用顺序执行最多 50 个动作（点击/拖拽/滚动/按键/文本/等待/激活）；整批只校验一次 `screenshotId`，坐标自动带上同一快照的裁剪与缩放参数 |
 | `sky__type_text` / `sky__press_key` | 字面文本输入 / 组合键（`Enter`、`ctrl+s` 等） |
 | `sky__set_value` / `sky__perform_secondary_action` | UIA 值模式写入 / 次级动作（Raise、Scroll Up/Down/Left/Right、Expand、Collapse） |
 | `sky__launch_app` | 按应用 id、AUMID、可执行文件路径或应用名启动应用 |
