@@ -36,7 +36,7 @@ export const Config = Schema.object({
 
 const PROVIDER_NAME = 'sky-windows';
 
-const GUIDANCE = `The sky__ computer-use tools operate this Windows host desktop through a locally staged native helper. Discover the exact app and window first, then take a fresh sky_get_window_state snapshot before acting; element_index values and cached bounds belong to that snapshot only and are invalidated by the next snapshot of the same window.
+const GUIDANCE = `The sky__ computer-use tools operate this Windows host desktop through a locally staged native helper. Discover the exact app and window first, then take a fresh sky__get_window_state snapshot before acting; element_index values and cached bounds belong to that snapshot only and are invalidated by the next snapshot of the same window.
 
 Pass the window handle as {app, id}, where app is the process:... address from a listing (not the sky__list_apps id) and id is the raw HWND. Prefer element targets from the latest tree; when a window exposes no usable UIA tree (common for UWP apps such as Notepad), drive it from the screenshot with coordinates instead of re-requesting the tree. Keyboard and text input reaches the foreground window: call sky__activate_window on the target immediately before any input tool.
 

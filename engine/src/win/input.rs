@@ -47,7 +47,7 @@ fn mouse(x: i32, y: i32, flags: MOUSE_EVENT_FLAGS, data: u32) {
                 mouseData: data,
                 dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 time: 0,
-                dwExtraInfo: usize::default(),
+                dwExtraInfo: crate::escape::SYNTH_INPUT_MARKER,
             },
         },
     };
@@ -65,7 +65,7 @@ fn key(vk: u16, flags: KEYBD_EVENT_FLAGS, scan: u16) {
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: usize::default(),
+                dwExtraInfo: crate::escape::SYNTH_INPUT_MARKER,
             },
         },
     };
@@ -87,7 +87,7 @@ pub fn type_text(text: &str) -> usize {
                     wScan: u,
                     dwFlags: KEYEVENTF_UNICODE,
                     time: 0,
-                    dwExtraInfo: usize::default(),
+                    dwExtraInfo: crate::escape::SYNTH_INPUT_MARKER,
                 },
             },
         };
@@ -99,7 +99,7 @@ pub fn type_text(text: &str) -> usize {
                     wScan: u,
                     dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
                     time: 0,
-                    dwExtraInfo: usize::default(),
+                    dwExtraInfo: crate::escape::SYNTH_INPUT_MARKER,
                 },
             },
         };

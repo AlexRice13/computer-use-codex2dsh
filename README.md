@@ -49,13 +49,19 @@ helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
 ## 前置要求
 
 - **Windows 10/11**（桌面自动化仅存在于 Windows）。
-- **DeepSeek Harness**（提供 `@deepseek-ai/cordis` `~4.0.5`、`dsh-tools` / `dsh-system-prompt` / `dsh-computer-use` `0.2.1-rc.5` 等 peer 依赖的宿主环境）。
+- **DeepSeek Harness `0.2.2-rc.1`**（peer 依赖 `@deepseek-ai/dsh-system-prompt` / `dsh-tools` 为 `^0.2.2-rc.1`，cordis 为 `~4.1.0`；0.2.1 及更早版本会被 bundle 版本校验拒绝）。
 - **Node.js**（`node.exe`，用于运行本地 `app-server` 桩；可用 `nodePath` 指定）。
 - 使用内置开源引擎时**无需**安装 OpenAI Codex / ChatGPT 桌面版。
 
 ## 安装
 
-把本仓库放进 DSH profile 可解析的位置后，用 Harness 的 plugin manager 安装，或直接把 `cordis.patch.yml` 的两条 `insert` 合并进你的 profile composition，并让 `name:` 指向本包（`computer-use-codex2dsh`）。插件平台标记为 `win32`。
+`plugin_manager` 对本地目录使用 `link:` 协议，**不会**安装包的 `dependencies`，所以先把运行时依赖装进包内：
+
+```sh
+npm install --omit=dev
+```
+
+然后把本仓库放进 DSH profile 可解析的位置，用 Harness 的 plugin manager 安装，或直接把 `cordis.patch.yml` 的两条 `insert` 合并进你的 profile composition，并让 `name:` 指向本包（`computer-use-codex2dsh`）。插件平台标记为 `win32`。
 
 ## 配置
 
@@ -73,7 +79,7 @@ helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
 
 - **逐应用审批（fail-closed）**：助手首次触达某个应用时发出 `approvalRequest`，经 Harness 审批服务征询用户；没有审批服务或用户拒绝时一律拒绝。`allowed-once` 在同一 agent 会话内记住。
 - **不可覆盖的自我排除**：任何输入类工具（点击/输入/按键/激活等）与审批层三重拒绝把 Harness 自己当作目标，`autoApprove` 也无法解锁。
-- **物理 Esc**：助手以 130 退出并写入中断标记后，本回合内所有调用短路为「用户已停止电脑操作」；回合推进或标记被清理即自动恢复。
+- **物理 Esc**：只认**真实**按键——注入的 `SendInput`（包括代理自己的 `press_key Escape`）带 `LLKHF_INJECTED`/`SKY_ESC` 标记，不会触发中断。助手以 130 退出并写入中断标记后，本回合内所有调用短路为「用户已停止电脑操作」；回合推进或标记被清理即自动恢复。
 - **坐标守卫**：坐标输入必须携带该窗口最新快照的 `screenshotId`；快照期被窗口级覆盖物压住的点直接拒绝（目标应用自己的小菜单不误伤）。任何输入送达后旧快照坐标即失效。
 - 桌面操作对模型可见的护栏只是护栏：请在人工可监督的前提下使用。
 

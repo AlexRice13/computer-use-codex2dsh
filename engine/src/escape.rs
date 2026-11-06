@@ -10,10 +10,36 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage,
     KBDLLHOOKSTRUCT, MSG, PM_REMOVE, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, HHOOK,
+    LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
 };
 
 static ESC_SEEN: AtomicBool = AtomicBool::new(false);
 static TURN_KEY: Mutex<Option<String>> = Mutex::new(None);
+
+/// "SKY_ESC" sentinel stamped into dwExtraInfo on every SendInput event this
+/// helper injects (win::input). The watchdog treats records carrying it as
+/// synthetic even on drivers where LLKHF_INJECTED is not surfaced, and it
+/// documents our injections to any third-party hook.
+pub const SYNTH_INPUT_MARKER: usize = 0x534B_595F_4553_43;
+
+/// True only when the hook record is the user's *physical* Escape press.
+///
+/// SendInput-injected key events — our own press_key/type_text and any other
+/// automation — always carry LLKHF_INJECTED (or LLKHF_LOWER_IL_INJECTED when
+/// injected from a lower integrity level). Reacting to those made an agent's
+/// `press_key Escape` (a routine dialog-dismiss) report "the user stopped
+/// Computer Use with the physical Escape key". The dwExtraInfo sentinel is a
+/// second, injection-side stamp so our own events are filtered even if the
+/// injected flags are missing.
+fn is_physical_escape(vk: u32, flags: u32, extra_info: usize) -> bool {
+    if vk != VK_ESCAPE.0 as u32 {
+        return false;
+    }
+    if flags & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) != 0 {
+        return false;
+    }
+    extra_info != SYNTH_INPUT_MARKER
+}
 
 /// Update the current turn key ("<session>\0<turn>") from request meta.
 pub fn set_turn(key: &str) {
@@ -78,7 +104,7 @@ unsafe extern "system" fn hook_proc(
         let msg = wparam.0 as u32;
         if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if kb.vkCode as u32 == VK_ESCAPE.0 as u32 {
+            if is_physical_escape(kb.vkCode, kb.flags.0, kb.dwExtraInfo) {
                 ESC_SEEN.store(true, Ordering::SeqCst);
             }
         }
@@ -114,6 +140,39 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ESC: u32 = 0x1B;
+    const ENTER: u32 = 0x0D;
+
+    #[test]
+    fn physical_escape_interrupts() {
+        assert!(is_physical_escape(ESC, 0, 0));
+        // Unrelated flag bits (extended key, previous key down) must not matter.
+        assert!(is_physical_escape(ESC, 0x01 | 0x20, 0));
+    }
+
+    #[test]
+    fn injected_escape_never_interrupts() {
+        // LLKHF_INJECTED: SendInput (press_key Escape, type_text, automation).
+        assert!(!is_physical_escape(ESC, LLKHF_INJECTED.0, 0));
+        // LLKHF_LOWER_IL_INJECTED: injected from a lower integrity level.
+        assert!(!is_physical_escape(ESC, LLKHF_LOWER_IL_INJECTED.0, 0));
+        assert!(!is_physical_escape(ESC, LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0, 0));
+    }
+
+    #[test]
+    fn own_sentinel_escape_never_interrupts() {
+        // Second line of defense for our own injections when flags are absent.
+        assert!(!is_physical_escape(ESC, 0, SYNTH_INPUT_MARKER));
+        // A different sentinel is not ours.
+        assert!(is_physical_escape(ESC, 0, SYNTH_INPUT_MARKER ^ 0xFF));
+    }
+
+    #[test]
+    fn other_keys_never_interrupt() {
+        assert!(!is_physical_escape(ENTER, 0, 0));
+        assert!(!is_physical_escape(ENTER, LLKHF_INJECTED.0, 0));
+    }
 
     #[test]
     fn sanitize_matches_js_regex() {
