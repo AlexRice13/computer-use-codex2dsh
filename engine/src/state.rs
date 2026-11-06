@@ -1,6 +1,20 @@
 use crate::policy::Policy;
 use std::collections::{HashMap, HashSet};
 
+/// Geometry of one screenshot handed out with a snapshot: which part of the
+/// window it covers and how many JPEG px it has per logical window px.
+///
+/// Coordinate tools receive model-measured pixels from this image, so they
+/// must undo both the crop offset and the downscale before reaching the
+/// screen. A default snapshot is `offset (0,0)`, `scale 1.0`, which reproduces
+/// the original helper's window-relative logical coordinates exactly.
+#[derive(Clone)]
+pub struct ShotGeom {
+    pub id: String,
+    pub offset: (f64, f64),
+    pub scale: f64,
+}
+
 /// A get_window_state snapshot kept per window so element_index actions
 /// resolve against the tree the model just saw (the helper owns this cache;
 /// a newer snapshot for the same window replaces it wholesale).
@@ -15,6 +29,8 @@ pub struct WindowSnapshot {
     pub elements: Vec<crate::win::uia::ElementRecord>,
     /// Ids of screenshots handed out with this snapshot.
     pub shot_ids: Vec<String>,
+    /// Per-screenshot crop/scale geometry (coordinate mapping).
+    pub shots: Vec<ShotGeom>,
     /// Rendered tree text (replayed on cache hits, revision stays put).
     pub tree: String,
     pub focused_element: Option<String>,
@@ -43,6 +59,10 @@ pub struct EngineState {
     pub last_turn_key: Option<String>,
     /// Latest snapshot per window (element_index resolution source).
     pub snapshots: HashMap<isize, WindowSnapshot>,
+    /// Latest screenshot geometry per window, independent of the tree cache:
+    /// `include_text: false` captures still have to map their pixels back to
+    /// the screen for coordinate input.
+    pub shot_geoms: HashMap<isize, Vec<ShotGeom>>,
     /// Monotonic counter bumped on every successful accessibility snapshot
     /// (diagnostic_state: snapshotRevision/accessibilityRevision).
     pub snapshot_revision: u64,
@@ -68,6 +88,7 @@ impl EngineState {
             approved_apps: HashSet::new(),
             last_turn_key: None,
             snapshots: HashMap::new(),
+            shot_geoms: HashMap::new(),
             snapshot_revision: 0,
             snapshot_count: 0,
             last_capture_invalidation: None,

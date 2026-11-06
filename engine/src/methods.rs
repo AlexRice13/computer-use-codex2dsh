@@ -35,12 +35,26 @@ struct WindowOnly {
 }
 
 #[derive(Deserialize)]
+struct GwsRegion {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Deserialize)]
 struct GwsParams {
     window: WinRef,
     #[serde(default = "always_true", rename = "include_screenshot")]
     include_screenshot: bool,
     #[serde(default = "always_true", rename = "include_text")]
     include_text: bool,
+    /// JPEG px per logical window px; 1.0 keeps the original contract.
+    #[serde(default)]
+    scale: Option<f64>,
+    /// Crop in logical, window-relative px.
+    #[serde(default)]
+    region: Option<GwsRegion>,
 }
 
 #[derive(Deserialize)]
@@ -61,9 +75,9 @@ struct ClickParams {
     x: i32,
     y: i32,
     /// The original parses coordinates but never requires the id; the
-    /// wrapper enforces freshness on its side.
+    /// wrapper enforces freshness on its side. When present it also selects
+    /// the snapshot's crop/scale geometry.
     #[serde(default, rename = "screenshotId")]
-    #[allow(dead_code)]
     screenshot_id: Option<String>,
     #[serde(default, rename = "mouse_button")]
     mouse_button: Option<String>,
@@ -77,7 +91,6 @@ struct ScrollParams {
     x: i32,
     y: i32,
     #[serde(default, rename = "screenshotId")]
-    #[allow(dead_code)]
     screenshot_id: Option<String>,
     #[serde(default, rename = "scrollX")]
     scroll_x: i64,
@@ -97,7 +110,6 @@ struct DragParams {
     #[serde(rename = "to_y")]
     to_y: i32,
     #[serde(default, rename = "screenshotId")]
-    #[allow(dead_code)]
     screenshot_id: Option<String>,
 }
 
@@ -154,7 +166,7 @@ struct Resolved {
     scale: f64,
 }
 
-/// Screen-space point for a snapshot-relative coordinate.
+/// Screen point for a coordinate measured on one specific snapshot image.
 ///
 /// A snapshot pixel belongs to the screenshot's rectangle: the window's
 /// extended frame in logical pixels. The physical target is therefore the
@@ -163,11 +175,40 @@ struct Resolved {
 /// behaviour) landed every click short of the target by a factor of the scale
 /// — measured at 200%: snapshot (600,400) arrived at screen (621,821) physical
 /// instead of (1231,820).
-fn to_screen(r: &Resolved, x: i32, y: i32) -> (i32, i32) {
+///
+/// A downscaled (`scale`) or cropped (`region`) snapshot has more/fewer JPEG
+/// pixels than logical window pixels, so the model's `(x, y)` must first be
+/// divided by the shot scale and shifted by the crop offset. Unknown/missing
+/// ids fall back to the original window-relative mapping.
+fn to_screen_shot(
+    r: &Resolved,
+    st: &EngineState,
+    shot_id: Option<&str>,
+    x: i32,
+    y: i32,
+) -> (i32, i32) {
+    let mut offset = (0.0f64, 0.0f64);
+    let mut shot_scale = 1.0f64;
+    if let Some(id) = shot_id {
+        let candidates = st
+            .shot_geoms
+            .get(&(r.hwnd.0 as isize))
+            .or_else(|| st.snapshots.get(&(r.hwnd.0 as isize)).map(|s| &s.shots));
+        if let Some(geoms) = candidates {
+            if let Some(geom) = geoms.iter().find(|g| g.id == id) {
+                offset = geom.offset;
+                if geom.scale.is_finite() && geom.scale > 0.0 {
+                    shot_scale = geom.scale;
+                }
+            }
+        }
+    }
+    let logical_x = offset.0 + x as f64 / shot_scale;
+    let logical_y = offset.1 + y as f64 / shot_scale;
     let s = if r.scale.is_finite() && r.scale > 0.0 { r.scale } else { 1.0 };
     (
-        r.origin.0 + (x as f64 * s).round() as i32,
-        r.origin.1 + (y as f64 * s).round() as i32,
+        r.origin.0 + (logical_x * s).round() as i32,
+        r.origin.1 + (logical_y * s).round() as i32,
     )
 }
 
@@ -572,7 +613,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
-                    let (x, y) = to_screen(&r, p.x, p.y);
+                    let (x, y) = to_screen_shot(&r, st, p.screenshot_id.as_deref(), p.x, p.y);
                     let button = match p.mouse_button.as_deref() {
                         Some("right") => crate::win::input::Button::Right,
                         Some("middle") => crate::win::input::Button::Middle,
@@ -591,7 +632,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
-                    let (x, y) = to_screen(&r, p.x, p.y);
+                    let (x, y) = to_screen_shot(&r, st, p.screenshot_id.as_deref(), p.x, p.y);
                     crate::win::input::wheel(x, y, p.scroll_x as i32, p.scroll_y as i32);
                     Response::Result(json!({}))
                 }
@@ -605,8 +646,8 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             match resolve_and_approve(st, &p.window, meta) {
                 Ok(r) => {
-                    let from = to_screen(&r, p.from_x, p.from_y);
-                    let to = to_screen(&r, p.to_x, p.to_y);
+                    let from = to_screen_shot(&r, st, p.screenshot_id.as_deref(), p.from_x, p.from_y);
+                    let to = to_screen_shot(&r, st, p.screenshot_id.as_deref(), p.to_x, p.to_y);
                     crate::win::input::drag(from, to);
                     Response::Result(json!({}))
                 }
@@ -804,25 +845,38 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 "screenshots": json!([]),
             });
 
+            let mut shot_geom: Option<crate::state::ShotGeom> = None;
             if p.include_screenshot {
-                match crate::win::capture::capture_window_jpeg_ex(hwnd) {
-                    Ok((jpeg, w, h, origin_x, origin_y)) => {
+                let opts = crate::win::capture::CaptureOpts {
+                    scale: p.scale.unwrap_or(1.0),
+                    region: p.region.as_ref().map(|r| (r.x, r.y, r.width, r.height)),
+                };
+                match crate::win::capture::capture_window_shot(hwnd, opts) {
+                    Ok(shot) => {
                         st.last_capture_invalidation = None;
                         use base64::Engine as _;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.jpeg);
                         // Field set, ids and geometry mirror the original's
                         // screenshot records exactly: `id` "screenshot-<n>",
                         // the window's screen origin in logical px, no
-                        // `hasContent` (the original never emits it).
+                        // `hasContent` (the original never emits it). `scale`
+                        // is additive: it is 1.0 when the caller used the
+                        // default full-size capture.
                         result["screenshots"] = json!([{
                             "id": "screenshot-0",
                             "url": format!("data:image/jpeg;base64,{b64}"),
-                            "originX": origin_x,
-                            "originY": origin_y,
-                            "width": w,
-                            "height": h,
+                            "originX": shot.origin_x,
+                            "originY": shot.origin_y,
+                            "width": shot.width,
+                            "height": shot.height,
                             "zIndex": 0,
+                            "scale": shot.scale,
                         }]);
+                        shot_geom = Some(crate::state::ShotGeom {
+                            id: "screenshot-0".into(),
+                            offset: (shot.offset_x as f64, shot.offset_y as f64),
+                            scale: shot.scale,
+                        });
                     }
                     // Capture failed (e.g. the Windows screen-recording
                     // consent gate denies this exe path, a locked session, or
@@ -837,6 +891,11 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                         st.last_capture_invalidation = Some(e);
                     }
                 }
+            }
+            // Coordinate mapping must work even for text-free snapshots, so
+            // the geometry lives outside the tree cache.
+            if let Some(geom) = shot_geom.clone() {
+                st.shot_geoms.insert(hwnd.0 as isize, vec![geom]);
             }
 
             if p.include_text {
@@ -858,7 +917,28 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                     }
                 });
                 let (tree, focused_element, document_text) = match hit {
-                    Some(t) => t,
+                    Some(t) => {
+                        // The tree is replayed, but this capture may have used a
+                        // different scale/region: keep the coordinate geometry
+                        // in sync with the screenshot the model just received.
+                        if let Some(geom) = shot_geom.clone() {
+                            if let Some(snap) = st.snapshots.get_mut(&key) {
+                                snap.shots = vec![geom];
+                                snap.shot_ids = result
+                                    .get("screenshots")
+                                    .and_then(Value::as_array)
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|s| {
+                                                s.get("id").and_then(Value::as_str).map(String::from)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                            }
+                        }
+                        t
+                    }
                     None => {
                         let app_name = header_app_name(&r.owner);
                         match crate::win::uia::build_tree(hwnd, &app_name) {
@@ -891,6 +971,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                                         size: r.size,
                                         elements: built.elements,
                                         shot_ids,
+                                        shots: shot_geom.clone().into_iter().collect(),
                                         tree: built.tree,
                                         focused_element: built.focused_element,
                                         document_text: built.document_text,

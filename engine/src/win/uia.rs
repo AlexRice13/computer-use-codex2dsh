@@ -12,6 +12,7 @@
 use uiautomation::core::{UIAutomation, UIElement};
 use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
 /// One row of the flattened snapshot tree, kept for element_index actions.
 pub struct ElementRecord {
@@ -615,7 +616,19 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
         .map_err(|e| format!("walker: {e}"))?;
 
     let started = now_ms();
-    let mut snapshot = walk_snapshot(&walker, &root, started);
+    // Window frame in screen px plus its DPI factor: element rects are screen
+    // physical, but the tree is rendered for a model measuring on the logical
+    // window screenshot, so each row carries window-relative logical bounds.
+    let (win_origin, win_scale) = {
+        let origin = root
+            .get_bounding_rectangle()
+            .map(|r| (r.get_left(), r.get_top()))
+            .unwrap_or((0, 0));
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        let scale = if dpi > 0 { dpi as f64 / 96.0 } else { 1.0 };
+        (origin, if scale.is_finite() && scale > 0.0 { scale } else { 1.0 })
+    };
+    let mut snapshot = walk_snapshot(&walker, &root, started, win_origin, win_scale);
 
     // Wake path: entered ONLY when the first walk came back looking like the
     // synthesized stub. A window that walked normally returns from build_tree
@@ -646,7 +659,7 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
         // An explicit SKY_WAKE=1 still runs the wake at Low IL: the diagnosis
         // is ours to report, not to hide an experiment behind.
         if wake_enabled() && run_wake_attempt(hwnd, started) {
-            let next = walk_snapshot(&walker, &root, started);
+            let next = walk_snapshot(&walker, &root, started, win_origin, win_scale);
             // Growth-stable settle: after a wake that actually landed, keep
             // re-walking until the tree is past the stub and stops growing.
             // OPT-IN (SKY_WAKE_RETRY=1), still bounded by TREE_BUDGET_MS.
@@ -667,7 +680,7 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
                 while now_ms() < deadline {
                     pump_messages(RETRY_INTERVAL_MS);
                     rounds += 1;
-                    let grown = walk_snapshot(&walker, &root, started);
+                    let grown = walk_snapshot(&walker, &root, started, win_origin, win_scale);
                     let n = grown.elements.len();
                     snapshot = grown;
                     if n > STUB_MAX && n == last {
@@ -725,6 +738,8 @@ fn walk_snapshot(
     walker: &uiautomation::core::UITreeWalker,
     root: &UIElement,
     started: u64,
+    win_origin: (i32, i32),
+    win_scale: f64,
 ) -> Snapshot {
     let mut elements: Vec<ElementRecord> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
@@ -734,6 +749,8 @@ fn walk_snapshot(
         root,
         0,
         started,
+        win_origin,
+        win_scale,
         &mut elements,
         &mut lines,
         &mut last_document,
@@ -753,6 +770,8 @@ fn walk(
     node: &UIElement,
     depth: usize,
     started: u64,
+    win_origin: (i32, i32),
+    win_scale: f64,
     elements: &mut Vec<ElementRecord>,
     lines: &mut Vec<String>,
     last_document: &mut Option<String>,
@@ -839,6 +858,16 @@ fn walk(
     if !automation_id.is_empty() {
         label.push_str(&format!(" ID: {automation_id}"));
     }
+    // Window-relative logical bounds: what a model measuring on the window
+    // screenshot needs for a coordinate click without guessing.
+    if rect.2 > 0 && rect.3 > 0 {
+        let s = win_scale;
+        let lx = ((rect.0 - win_origin.0) as f64 / s).round() as i32;
+        let ly = ((rect.1 - win_origin.1) as f64 / s).round() as i32;
+        let lw = (rect.2 as f64 / s).round() as i32;
+        let lh = (rect.3 as f64 / s).round() as i32;
+        label.push_str(&format!(" @{lx},{ly} {lw}x{lh}"));
+    }
     if control_type == "Window" {
         label.push_str(" Secondary Actions: Raise");
     }
@@ -855,7 +884,7 @@ fn walk(
         }
     };
     while let Some(c) = child {
-        walk(walker, &c, depth + 1, started, elements, lines, last_document);
+        walk(walker, &c, depth + 1, started, win_origin, win_scale, elements, lines, last_document);
         if elements.len() >= MAX_ELEMENTS || (now_ms() - started) as u128 > TREE_BUDGET_MS {
             break;
         }

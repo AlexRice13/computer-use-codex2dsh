@@ -274,18 +274,37 @@ pub fn wheel(x: i32, y: i32, scroll_x: i32, scroll_y: i32) {
     }
 }
 
+/// Press, move and release the left button.
+///
+/// Distance-proportional interpolation matters: a long drag (a shape or a
+/// selection in Paint) only commits when the target sees enough
+/// `WM_MOUSEMOVE` samples *and* a settle before `MOUSEEVENTF_LEFTUP`. The old
+/// fixed 12 steps with no delay left long drags as a live rubber-band preview
+/// (the target never saw the button come up as a completed gesture).
 pub fn drag(from: (i32, i32), to: (i32, i32)) {
     mouse(from.0, from.1, MOUSEEVENTF_MOVE, 0);
+    std::thread::sleep(std::time::Duration::from_millis(15));
     mouse(from.0, from.1, MOUSEEVENTF_LEFTDOWN, 0);
-    // Intermediate moves help targets that track drag via WM_MOUSEMOVE.
-    let steps = 12;
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let dx = (to.0 - from.0) as f64;
+    let dy = (to.1 - from.1) as f64;
+    let distance = (dx * dx + dy * dy).sqrt();
+    let steps = ((distance / 6.0).ceil() as i64).clamp(12, 96);
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
-        let x = (from.0 as f64 + (to.0 - from.0) as f64 * t).round() as i32;
-        let y = (from.1 as f64 + (to.1 - from.1) as f64 * t).round() as i32;
+        // Ease in/out so the first and last pixels are not skipped.
+        let e = t * t * (3.0 - 2.0 * t);
+        let x = (from.0 as f64 + dx * e).round() as i32;
+        let y = (from.1 as f64 + dy * e).round() as i32;
         mouse(x, y, MOUSEEVENTF_MOVE, 0);
+        std::thread::sleep(std::time::Duration::from_millis(4));
     }
+    // Land exactly on the target and hold briefly so the target processes the
+    // final move before the release.
+    mouse(to.0, to.1, MOUSEEVENTF_MOVE, 0);
+    std::thread::sleep(std::time::Duration::from_millis(40));
     mouse(to.0, to.1, MOUSEEVENTF_LEFTUP, 0);
+    std::thread::sleep(std::time::Duration::from_millis(20));
 }
 
 #[cfg(test)]

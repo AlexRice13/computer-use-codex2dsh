@@ -486,19 +486,62 @@ fn logical_rect(hwnd: HWND, scale: f64, item: (usize, usize)) -> (i32, i32, usiz
     }
 }
 
+/// Capture options for a model-facing snapshot.
+///
+/// `scale` is applied on top of the logical window pixels (1.0 = the original
+/// contract, 0.5 = half-size JPEG for token-starved turns). `region` crops the
+/// window in logical window-relative px, which is how a model asks for "just
+/// this panel" without paying for the whole window.
+#[derive(Clone, Copy)]
+pub struct CaptureOpts {
+    pub scale: f64,
+    pub region: Option<(i32, i32, i32, i32)>,
+}
+
+impl Default for CaptureOpts {
+    fn default() -> Self {
+        CaptureOpts { scale: 1.0, region: None }
+    }
+}
+
+/// One encoded screenshot: bytes plus the geometry a coordinate tool needs to
+/// map a pixel measured on this JPEG back to the screen.
+pub struct CapturedShot {
+    pub jpeg: Vec<u8>,
+    /// JPEG pixel dimensions (already scaled/cropped).
+    pub width: usize,
+    pub height: usize,
+    /// Screen origin of the captured region, in logical px (`originX/Y`).
+    pub origin_x: i32,
+    pub origin_y: i32,
+    /// Captured-region offset inside the window, logical px.
+    pub offset_x: i32,
+    pub offset_y: i32,
+    /// JPEG px per logical window px (1.0 unless a `scale` was requested).
+    pub scale: f64,
+}
+
 /// Capture one frame of `hwnd`; returns (jpeg bytes, width, height).
 ///
 /// Width/height are the *logical* px the original reports (and the JPEG's own
 /// pixel dimensions), i.e. the physical WGC frame divided by the window's DPI
 /// scale.
 pub fn capture_window_jpeg(hwnd: HWND) -> Result<(Vec<u8>, usize, usize), String> {
-    let (jpeg, w, h, _, _) = capture_window_jpeg_ex(hwnd)?;
-    Ok((jpeg, w, h))
+    let shot = capture_window_shot(hwnd, CaptureOpts::default())?;
+    Ok((shot.jpeg, shot.width, shot.height))
 }
 
 /// As [`capture_window_jpeg`], plus the screen origin of the captured region
 /// in the same logical px the original reports in `originX`/`originY`.
+#[allow(dead_code)] // kept for callers that still want the tuple form
 pub fn capture_window_jpeg_ex(hwnd: HWND) -> Result<(Vec<u8>, usize, usize, i32, i32), String> {
+    let shot = capture_window_shot(hwnd, CaptureOpts::default())?;
+    Ok((shot.jpeg, shot.width, shot.height, shot.origin_x, shot.origin_y))
+}
+
+/// Capture `hwnd` honoring [`CaptureOpts`]: optional logical-px crop and a
+/// post-crop downscale, with the geometry needed to undo both.
+pub fn capture_window_shot(hwnd: HWND, opts: CaptureOpts) -> Result<CapturedShot, String> {
     let started = Instant::now();
     let mut rect = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut rect).map_err(|e| format!("window rect: {e}"))? };
@@ -557,21 +600,57 @@ pub fn capture_window_jpeg_ex(hwnd: HWND) -> Result<(Vec<u8>, usize, usize, i32,
     }
 
     // The original reports/serves logical pixels: physical frame / DPI scale.
-    let target_w = ((frame.w as f64) / scale).round().max(1.0) as usize;
-    let target_h = ((frame.h as f64) / scale).round().max(1.0) as usize;
-    let jpeg = encode_jpeg(&frame, target_w, target_h)?;
+    let logical_w = ((frame.w as f64) / scale).round().max(1.0) as usize;
+    let logical_h = ((frame.h as f64) / scale).round().max(1.0) as usize;
+
+    // Optional logical-px crop, clamped to the window.
+    let (rx, ry, rw, rh) = match opts.region {
+        None => (0, 0, logical_w, logical_h),
+        Some((x, y, w, h)) => {
+            let rw = (w.max(1) as usize).min(logical_w);
+            let rh = (h.max(1) as usize).min(logical_h);
+            let rx = (x.max(0) as usize).min(logical_w.saturating_sub(1));
+            let ry = (y.max(0) as usize).min(logical_h.saturating_sub(1));
+            (rx, ry, rw.min(logical_w - rx), rh.min(logical_h - ry))
+        }
+    };
+    let out_scale = if opts.scale.is_finite() && opts.scale > 0.0 {
+        opts.scale.clamp(0.05, 1.0)
+    } else {
+        1.0
+    };
+    let target_w = ((rw as f64) * out_scale).round().max(1.0) as usize;
+    let target_h = ((rh as f64) * out_scale).round().max(1.0) as usize;
+
+    // Cropping happens on the physical frame so the downscale is a single WIC
+    // pass; the crop is the requested logical region times the DPI factor.
+    let px = ((rx as f64) * scale).round() as usize;
+    let py = ((ry as f64) * scale).round() as usize;
+    let pw = (((rw as f64) * scale).round() as usize).max(1);
+    let ph = (((rh as f64) * scale).round() as usize).max(1);
+    let cropped = crop(&frame, px, py, pw, ph)?;
+    let jpeg = encode_jpeg(&cropped, target_w, target_h)?;
     let mean = frame.px.iter().step_by(4 * 997).map(|&b| b as u64).sum::<u64>()
         / (frame.px.len() / (4 * 997)).max(1) as u64;
     tr!("  frame mean-blue={mean} (0 => black/undrawn surface)");
     let (origin_x, origin_y, _, _) = logical_rect(hwnd, scale, (frame.w, frame.h));
     tr!(
-        "captured hwnd={key} {}x{} -> {target_w}x{target_h} @({origin_x},{origin_y}) jpeg={}B in {}ms",
+        "captured hwnd={key} {}x{} -> crop=({rx},{ry},{rw},{rh}) -> {target_w}x{target_h} @({origin_x},{origin_y}) scale={out_scale} jpeg={}B in {}ms",
         frame.w,
         frame.h,
         jpeg.len(),
         started.elapsed().as_millis()
     );
-    Ok((jpeg, target_w, target_h, origin_x, origin_y))
+    Ok(CapturedShot {
+        jpeg,
+        width: target_w,
+        height: target_h,
+        origin_x: origin_x + rx as i32,
+        origin_y: origin_y + ry as i32,
+        offset_x: rx as i32,
+        offset_y: ry as i32,
+        scale: out_scale,
+    })
 }
 
 /// BGRA rows → JPEG via WIC, scaled to the reported logical size.
