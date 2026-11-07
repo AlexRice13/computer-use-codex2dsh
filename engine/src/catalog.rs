@@ -11,7 +11,7 @@ use crate::win::com::ComGuard;
 use crate::win::enumerate::WindowRecord;
 use crate::win::identity::{self, CLSID_SHELL_LINK};
 
-/// Known-folder GUID literals the helper uses as id prefixes (observed).
+/// 原版 helper 拿这几个已知文件夹 GUID 当 id 前缀（实测到的）。
 const PROGRAM_FILES_GUID: &str = "{6D809377-6AF0-444B-8957-A3773F02200E}";
 const PROGRAM_FILES_X86_GUID: &str = "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}";
 const SYSTEM32_GUID: &str = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}";
@@ -25,7 +25,7 @@ pub struct AppRecord {
     pub use_count: Option<u32>,
 }
 
-/// One scanned shortcut.
+/// 一条扫出来的快捷方式。
 struct LnkEntry {
     path_lower: String,
     stem: String,
@@ -33,16 +33,14 @@ struct LnkEntry {
     exe: Option<String>,
 }
 
-/// Build the list_apps array. The real helper's entry set is *curated*: it
-/// lists running apps plus exactly the UserAssist usage history (verified:
-/// 40 entries = 2 running + 38 usage records). Reproduce that: drive entries
-/// from UserAssist, resolve presentation (ids/display names) through the
-/// Start Menu / Desktop shortcut catalog, and synthesize running apps the
-/// catalog cannot claim.
+/// 拼出 list_apps 那个数组。原版 helper 的条目集合是挑过的：正在跑的应用，
+/// 加上 UserAssist 里的使用历史，就这么多（实测：40 条 = 2 个在跑 + 38 条
+/// 使用记录）。这里照做：条目从 UserAssist 来，展示用的 id 和显示名去
+/// 开始菜单/桌面快捷方式目录里解，目录认不出来的正在跑的应用再补一条。
 pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
     let _com = ComGuard::new();
 
-    // Group live windows by their runtime app id.
+    // 把正在跑的窗口按运行时 app id 分组。
     let mut by_app: HashMap<String, Vec<&WindowRecord>> = HashMap::new();
     for r in records {
         by_app.entry(r.app.clone()).or_default().push(r);
@@ -50,9 +48,9 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
 
     let lnks = scan_lnk_entries();
     let assist = user_assist::collect();
-    // The helper's date block is the *intersection* of UserAssist with the
-    // shell AppsFolder catalog (verified: UA-only noise — installed exes,
-    // cmd.exe, installers — never appears). Fetch the catalog up front.
+    // 原版给日期的那一块，是 UserAssist 和 shell AppsFolder 目录的*交集*
+    // （实测：只在 UserAssist 里出现的噪音 —— 装好的 exe、cmd.exe、安装
+    // 程序 —— 从来不露头）。所以先把目录拉下来。
     let apps = crate::startapps::collect();
     let apps_lower: std::collections::HashSet<String> =
         apps.iter().map(|(_, id)| id.to_lowercase()).collect();
@@ -71,15 +69,15 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
     let mut out: Vec<AppRecord> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Pass A: bare AUMID entries first (so packaged exe-path entries under
-    // \WindowsApps\ can be folded into them).
+    // 第一遍：先处理裸 AUMID 条目（后面 \WindowsApps\ 下那些打包 exe 路径
+    // 才好并进来）。
     for info in &assist_entries {
         let key = info.decoded.trim();
         if !identity::looks_like_aumid(key) {
             continue;
         }
-        // Microsoft packaged AUMIDs (shell components etc.) never surface as
-        // history entries (verified: Game Bar, Notepad, Terminal, Store…).
+        // 微软自家打包的 AUMID（shell 组件之类）从不作为历史条目出现
+        // （实测：Game Bar、Notepad、Terminal、Store…都不出现）。
         let kl = key.to_lowercase();
         if kl.starts_with("microsoft.") && kl.contains('_') && kl.contains('!') {
             continue;
@@ -98,16 +96,16 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
             is_running,
             windows: wins,
             last_used_date: if is_running { None } else { info.last_used_date.clone() },
-            // Measured: the original emits useCount: 0 (with the date) for
-            // launched-then-uncounted records — no omission at zero.
+            // 实测：先启动、但没算进次数的记录，原版照样输出 useCount: 0
+            // （日期也一起带上），0 不省略。
             use_count: if is_running { None } else { Some(info.use_count) },
         });
     }
 
-    // Pass B: path entries (.lnk, .exe, GUID-prefixed). Each UserAssist key
-    // is resolved to a catalog entry (exact AppID, shortcut target/URI, or
-    // shortcut-name match); keys with no catalog counterpart are noise
-    // (downloaded installers, cmd.exe, …) and never surface.
+    // 第二遍：路径类条目（.lnk、.exe、带 GUID 前缀的）。每条 UserAssist key
+    // 都去目录里找对应条目：精确 AppID、快捷方式目标或 URI、快捷方式名字
+    // 匹配。目录里没有对应物的就是噪音（下载的安装包、cmd.exe 之类），从来
+    // 不露头。
     let a_count = out.len();
     let by_appid: HashMap<String, (String, String)> = apps
         .iter()
@@ -144,11 +142,11 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
                 hit = by_display.get(&stem).cloned();
             }
         } else if lower.contains("://") {
-            // Protocol URI launches (steam://…) match the catalog directly.
+            // 协议 URI 启动的（steam://…）直接拿 key 去目录里对。
             hit = lookup(key);
         } else if lower.ends_with(".exe") {
             let expanded = expand_guid_prefix(key);
-            // Fold packaged app exe paths into their bare-AUMID entry.
+            // 把打包应用的 exe 路径并进它那条裸 AUMID 条目。
             if expanded.to_lowercase().contains("\\windowsapps\\")
                 && seen_ids
                     .iter()
@@ -156,10 +154,9 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
             {
                 continue;
             }
-            // Match order: exact AppID (raw and known-folder-folded),
-            // shortcut whose target is this exe, shortcut named after the
-            // exe stem / an ancestor folder (steam launchers), catalog
-            // display equal to the exe stem.
+            // 匹配顺序：精确 AppID（原始路径，以及折成已知文件夹前缀的），
+            // 目标就是这个 exe 的快捷方式，名字等于 exe 文件名或某级父目录名
+            // 的快捷方式（steam 启动器），显示名等于 exe 文件名的目录条目。
             hit = lookup(key)
                 .or_else(|| lookup(&expanded))
                 .or_else(|| lookup(&catalog_id_for_exe(&expanded)))
@@ -238,17 +235,16 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
             is_running,
             windows: wins,
             last_used_date: if is_running { None } else { info.last_used_date.clone() },
-            // Measured: the original emits useCount: 0 (with the date) for
-            // launched-then-uncounted records — no omission at zero.
+            // 实测：先启动、但没算进次数的记录，原版照样输出 useCount: 0
+            // （日期也一起带上），0 不省略。
             use_count: if is_running { None } else { Some(info.use_count) },
         });
     }
 
-    // Pass C: the shell "AppsFolder" application catalog (same source as
-    // Get-StartApps / Windows.UI.Shell.ApplicationInformation.FindAllAsync).
-    // The helper appends these alphabetically (display name), attaching
-    // UserAssist counts when the record matches by id, then truncates the
-    // whole list to 40 entries (verified against the real helper).
+    // 第三遍：shell 那个 "AppsFolder" 应用目录（跟 Get-StartApps /
+    // Windows.UI.Shell.ApplicationInformation.FindAllAsync 同一份数据）。
+    // 原版把这些按显示名排序追加在后面，id 对得上的再挂上 UserAssist 的次数，
+    // 最后整个列表截到 40 条（对着原版 helper 实测过）。
     let b_count = out.len();
     if trace {
         eprintln!("[trace] catalog: passA={} passB={}", a_count, b_count - a_count);
@@ -263,10 +259,9 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
         }
         let wins = take_windows(&mut by_app, &appid, None);
         let is_running = !wins.is_empty();
-        // Attach UserAssist counts only for plain records: Microsoft
-        // packaged AUMIDs never carry history, and a record whose UA entry
-        // still has a live date but was not admitted to the date block is
-        // considered stale (helper drops both date and count).
+        // 只有普通记录才挂 UserAssist 次数：微软打包的 AUMID 从来不带历史；
+        // UserAssist 里还有日期、但没进日期块的记录算过期（原版把日期和次数
+        // 一起扔掉）。
         let is_ms_pkg = lower.starts_with("microsoft.") && lower.contains('_') && lower.contains('!');
         let assist_hit = if is_ms_pkg {
             None
@@ -291,8 +286,8 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
         });
     }
 
-    // Pass D: packaged AUMID windows and unclaimed process windows get
-    // synthesized records (id = the runtime identifier, matching observations).
+    // 第四遍：打包 AUMID 的窗口，加上没人认领的进程窗口，都合成一条记录
+    // （id 就用运行时标识符，跟实测对得上）。
     for (app, list) in std::mem::take(&mut by_app) {
         let wins: Vec<WindowRecord> = list.into_iter().cloned().collect();
         if wins.is_empty() {
@@ -312,8 +307,8 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
         });
     }
 
-    // Running records keyed by process path may carry a taskbar identity
-    // (apps that call SetAppUserModelID): the helper reports that AUMID.
+    // 正在跑、但 id 还是进程路径的记录，可能带着任务栏身份（那些自己调
+    // SetAppUserModelID 的应用）：原版报的是那个 AUMID。
     {
         let taskbar = crate::win::taskbar::appids();
         if !taskbar.is_empty() {
@@ -330,8 +325,7 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
                         return None;
                     }
                     taskbar.get(&t).cloned().or_else(|| {
-                        // "Foo — App" style titles still belong to the
-                        // taskbar button "App".
+                        // "Foo — App" 这种标题，仍然属于任务栏按钮 "App"。
                         taskbar
                             .iter()
                             .find(|(name, _)| name.len() >= 3 && t.contains(name.as_str()))
@@ -344,8 +338,8 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
         }
     }
 
-    // A running app absorbs its catalog/UserAssist twin (same display name):
-    // the helper lists such apps once, as the running record.
+    // 正在跑的应用会把同名的目录/UserAssist 副本吞掉：原版这种情况下只列
+    // 一条，就是那条正在跑的。
     let running_displays: std::collections::HashSet<String> = out
         .iter()
         .filter(|r| r.is_running)
@@ -355,8 +349,8 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
         r.is_running || !running_displays.contains(&r.display_name.as_deref().unwrap_or("").to_lowercase())
     });
 
-    // Observed order: running first (window count desc), then by
-    // lastUsedDate desc, then display name asc — keeps A/B deterministic.
+    // 实测的顺序：正在跑的排前面（窗口数多的靠前），然后按 lastUsedDate
+    // 倒序，再按显示名正序 —— 这样 A/B 对比才稳。
     out.sort_by(|a, b| {
         b.is_running
             .cmp(&a.is_running)
@@ -379,14 +373,14 @@ pub fn build_catalog(records: &[WindowRecord]) -> Vec<AppRecord> {
     out
 }
 
-/// Entries the helper never lists (browsers, terminals, shell/system UWPs).
-/// Word tables recovered from the binary's embedded lists (@ browser/terminal
-/// process tables) plus the concrete AUMID/ProgIDs observed filtered.
+/// 原版从来不列的条目（浏览器、终端、shell/系统 UWP）。
+/// 词表是从二进制里内嵌的清单抠出来的（@ browser/terminal 进程表），再加上
+/// 实测被过滤掉的那些具体 AUMID/ProgID。
 pub fn is_filtered(id: &str, display: Option<&str>) -> bool {
     let idl = id.to_lowercase();
     let dl = display.unwrap_or("").to_lowercase();
 
-    // Exact ids / prefixes (case-insensitive).
+    // 精确 id 和前缀（不区分大小写）。
     const PREFIXES: &[&str] = &[
         "microsoft.autogenerated.",
         "microsoft.windowsnotepad_",
@@ -410,8 +404,7 @@ pub fn is_filtered(id: &str, display: Option<&str>) -> bool {
     if PREFIXES.iter().any(|p| idl.starts_with(p)) {
         return true;
     }
-    // Web-link shortcuts (.url) never list; local-file targets (.chm, .txt,
-    // .ini) do.
+    // 网页快捷方式（.url）从不列出；本地文件目标（.chm、.txt、.ini）会列。
     if idl.ends_with(".url") {
         return true;
     }
@@ -420,15 +413,15 @@ pub fn is_filtered(id: &str, display: Option<&str>) -> bool {
         return true;
     }
 
-    // Browser binaries anywhere in the path.
+    // 路径里任何位置出现浏览器可执行文件，都滤掉。
     const BROWSER_WORDS: &[&str] =
         &["\\chrome\\", "\\msedge\\", "\\brave\\", "\\opera\\", "\\firefox\\", "iexplore"];
     if BROWSER_WORDS.iter().any(|w| idl.contains(w)) {
         return true;
     }
 
-    // Chat/cloud clients and shell helpers the helper never surfaces even in
-    // path form (verified: QQ, NetEase CloudMusic, CredentialUIBroker).
+    // 聊天/云客户端和 shell 辅助程序，就算以路径形式出现，原版也从不露头
+    // （实测：QQ、网易云音乐、CredentialUIBroker）。
     const NOISE_PATHS: &[&str] = &[
         "\\qqnt\\", "\\tencent\\qqnt\\", "\\netease\\cloudmusic\\",
         "credentialuibroker", "\\windowsapps\\",
@@ -437,8 +430,7 @@ pub fn is_filtered(id: &str, display: Option<&str>) -> bool {
         return true;
     }
 
-    // Terminal / console executables: exact file names from the binary's
-    // terminal table.
+    // 终端/控制台可执行文件：文件名照抄二进制里那张终端表。
     let stem = Path::new(&idl)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -453,7 +445,7 @@ pub fn is_filtered(id: &str, display: Option<&str>) -> bool {
         return true;
     }
 
-    // A couple of filter rules key off the display name.
+    // 有些过滤规则看的是显示名。
     if dl == "character map" || dl == "charmap" {
         return true;
     }
@@ -475,7 +467,7 @@ fn take_windows(
         .unwrap_or_default()
 }
 
-/// Does a bare AUMID entry already represent this packaged exe path?
+/// 这条裸 AUMID 条目是不是已经代表了这个打包 exe 路径？
 fn folds_package_exe(aumid: &str, exe_path: &str) -> bool {
     let (family, _) = aumid.split_once('!').unwrap_or((aumid, ""));
     let (name, publisher) = match family.rsplit_once('_') {
@@ -524,7 +516,7 @@ fn lnk_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Expand a `{KnownFolderGUID}\rest` UserAssist path to its filesystem path.
+/// 把 UserAssist 里 `{KnownFolderGUID}\rest` 形式的路径展开成文件系统路径。
 fn expand_guid_prefix(path: &str) -> String {
     let map = [
         (PROGRAM_FILES_GUID, std::env::var("ProgramFiles").ok()),
@@ -546,7 +538,8 @@ fn expand_guid_prefix(path: &str) -> String {
     path.to_string()
 }
 
-/// Byte-safe case-insensitive prefix check (paths may hold multi-byte chars).
+/// 按字节比较、不区分大小写的前缀判断（路径里可能有非 ASCII 字符，按字节
+/// 切才安全）。
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len()
         && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
@@ -597,7 +590,7 @@ fn resolve_lnk(lnk: &Path) -> Option<LnkTarget> {
         let wide: Vec<u16> = lnk.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         pf.Load(PCWSTR(wide.as_ptr()), STGM(0)).ok()?;
 
-        // Prefer a protocol URI in the arguments (steam://, ms-settings:, …).
+        // 先看参数里有没有协议 URI（steam://、ms-settings: 等等）。
         let mut argbuf = [0u16; 2048];
         if link.GetArguments(&mut argbuf).is_ok() {
             let args = cut(&argbuf);
@@ -615,15 +608,15 @@ fn resolve_lnk(lnk: &Path) -> Option<LnkTarget> {
         if link.GetPath(&mut pathbuf, std::ptr::null_mut(), 2u32).is_ok() {
             let p = cut(&pathbuf);
             if !p.trim().is_empty() {
-                // A URL target surfaces as a uri id too.
+                // 目标是 URL 的，一样当 uri id 处理。
                 if p.contains("://") {
                     return Some(LnkTarget::Uri(p));
                 }
                 return Some(LnkTarget::Exe(expand_env(&p)));
             }
         }
-        // Protocol shortcuts (steam://…, ms-settings:…) keep the URI only in
-        // special item-id fields; scan the raw bytes for it instead.
+        // 协议快捷方式（steam://…、ms-settings:…）的 URI 只藏在特殊的
+        // item-id 字段里，改成扫原始字节去找。
         if let Some(uri) = scan_uri_from_lnk_bytes(lnk) {
             return Some(LnkTarget::Uri(uri));
         }
@@ -631,7 +624,7 @@ fn resolve_lnk(lnk: &Path) -> Option<LnkTarget> {
     }
 }
 
-/// Cheap UTF-16LE scan for a `scheme://…` token inside a .lnk blob.
+/// 不做解析，直接在 .lnk 二进制里按 UTF-16LE 扫一遍，找 `scheme://…`。
 fn scan_uri_from_lnk_bytes(lnk: &Path) -> Option<String> {
     let bytes = std::fs::read(lnk).ok()?;
     if bytes.len() < 8 {
@@ -677,7 +670,7 @@ fn cut(buf: &[u16]) -> String {
 }
 
 fn expand_env(s: &str) -> String {
-    // .lnk targets are usually fully resolved already; cheap %VAR% pass only.
+    // .lnk 的目标一般已经展开好了，这里只顺手替一遍 %VAR%。
     let mut out = s.to_string();
     for (k, v) in [
         ("%APPDATA%", std::env::var("APPDATA").ok()),
@@ -691,7 +684,7 @@ fn expand_env(s: &str) -> String {
     out
 }
 
-/// id classification for a catalog exe path (observed forms).
+/// 给目录里的 exe 路径定 id（实测到的那几种形式）。
 fn catalog_id_for_exe(path: &str) -> String {
     if let Some(rel) = under_known(path, std::env::var("ProgramFiles").ok().as_deref(), PROGRAM_FILES_GUID) {
         return format!("{PROGRAM_FILES_GUID}\\{rel}");

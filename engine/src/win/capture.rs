@@ -1,24 +1,21 @@
-// Per-window capture with Windows.Graphics.Capture (WGC), matching the
-// original helper's occlusion-free screenshots, plus WIC JPEG encoding.
+// 用 Windows.Graphics.Capture（WGC）抓单个窗口，遮不遮挡都拍得到，跟原版
+// helper 一样；JPEG 走 WIC 编码。
 //
-// Behavioural notes (measured against the original codex-computer-use.exe):
-//   * The original caches one capture session per window (its binary carries
-//     `CachedGraphicsCaptureSession`, `Direct3D11CaptureFramePool.Recreate`
-//     and a `FrameArrived` handler) instead of building a pool per call. A
-//     pool built seconds before the first read only receives a frame when the
-//     target happens to repaint, which is why a freshly spawned engine
-//     returned `screenshots: []` for a background window while the plugin's
-//     long-lived engine returned one. Sessions are cached here the same way.
-//   * The original reports the window rect in *logical* px and its JPEG has
-//     exactly those pixel dimensions (maximised Chrome: origin (0,0)
-//     1920x1032 on a 3840x2160 desktop at 192 DPI, JPEG SOF dims 1920x1032).
-//     WGC hands out physical pixels, so the frame is scaled by the window's
-//     DPI factor before encoding.
-//   * When the window item yields no frame at all, the original falls back to
-//     another capturable surface (its strings carry `no desktop window`,
-//     `another window` and `IGraphicsCaptureItemInterop.CreateForMonitor`).
-//     The desktop window is used here as that last-resort surface, cropped to
-//     the target rect.
+// 下面几条是拿原版 codex-computer-use.exe 实测出来的：
+//   * 原版给每个窗口缓存一个 capture session（它二进制里有
+//     `CachedGraphicsCaptureSession`、`Direct3D11CaptureFramePool.Recreate`
+//     和一个 `FrameArrived` 处理），不是每次调用都新建 pool。为什么？调用
+//     前几秒才建好的 pool，只有目标碰巧重绘时才收得到帧。所以刚拉起来的
+//     engine 抓后台窗口返回 `screenshots: []`，而插件这个活得久的 engine 能
+//     抓到一帧。这里也照这个方式缓存 session。
+//   * 原版报的窗口矩形是*逻辑*px，JPEG 的像素尺寸跟它分毫不差（最大化
+//     Chrome：3840x2160、192 DPI 的桌面上，原点 (0,0)，尺寸 1920x1032，
+//     JPEG SOF 里也是 1920x1032）。WGC 给的是物理像素，所以编码前要按窗口
+//     的 DPI 比例缩一下。
+//   * 窗口 item 一帧都拿不到时，原版会换一个能抓的表面（它字符串里有
+//     `no desktop window`、`another window` 和
+//     `IGraphicsCaptureItemInterop.CreateForMonitor`）。这里拿桌面窗口当最后
+//     的退路，按目标矩形裁出来。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,28 +47,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetDesktopWindow, GetWindowRect, IsWindowVisible,
 };
 
-/// How long to wait for a first frame from a brand-new session. The original
-/// needs 2.5-6.5 s for a cold three-screenshot call, so seconds are on budget.
+/// 全新的 session 等第一帧最多等这么久。原版冷启动连拍三张要 2.5-6.5 s，
+/// 所以花几秒也在预算内。
 const FIRST_FRAME_BUDGET: Duration = Duration::from_millis(1200);
-/// Re-check window after a kick before giving up on the window item.
+/// kick 一下之后再看一眼窗口，然后才放弃这个窗口 item。
 const KICK_BUDGET: Duration = Duration::from_millis(900);
-/// A cached frame this old is worth one short poll for a fresher one.
+/// 缓存的帧老到这个程度，就值得再短轮询一次，看能不能拿到更新的。
 const STALE_AFTER: Duration = Duration::from_millis(250);
-/// A frame this young is used as-is.
+/// 帧新到这个程度，直接拿去用，不再等。
 const FRESH_ENOUGH: Duration = Duration::from_millis(60);
-/// Never spend longer than this on one screenshot overall (the caller's
-/// `x-oai-cua-request-budget-ms` is normally 19 s).
+/// 一张截图从头到尾花的时间不许超过这个数（调用方的
+/// `x-oai-cua-request-budget-ms` 通常是 19 s）。
 const TOTAL_BUDGET: Duration = Duration::from_millis(6500);
 const MAX_CACHED_SESSIONS: usize = 24;
 
 thread_local! {
     static DEVICE: RefCell<Option<(ID3D11Device, WinrtDevice)>> = const { RefCell::new(None) };
-    /// hwnd -> live capture session (the original's CachedGraphicsCaptureSession).
+    /// hwnd -> 还活着的 capture session（对应原版的 CachedGraphicsCaptureSession）。
     static SESSIONS: RefCell<HashMap<isize, Cached>> = RefCell::new(HashMap::new());
 }
 
-/// Env-gated (`SKY_CAPTURE_TRACE=1`) diagnostics on stderr. Off by default so
-/// the wire contract and the plugin's stderr tail stay untouched.
+/// 靠环境变量（`SKY_CAPTURE_TRACE=1`）才开的 stderr 诊断。默认关着，不然
+/// 会弄脏 wire 协议和插件 stderr 的尾巴。
 fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -89,7 +86,7 @@ macro_rules! tr {
     };
 }
 
-/// One decoded frame, copied out of the GPU so it survives the pool.
+/// 一帧解码好的画面，已经从 GPU 拷到 CPU 内存，pool 没了它也还在。
 #[derive(Clone)]
 struct Captured {
     w: usize,
@@ -107,7 +104,7 @@ struct Cached {
     last_at: Instant,
 }
 
-/// Ensure the shared D3D11 device and its WinRT wrapper exist.
+/// 拿到共享的 D3D11 device 和它的 WinRT 包装，没有就建一个。
 fn ensure_device() -> windows::core::Result<(ID3D11Device, WinrtDevice)> {
     if let Some(d) = DEVICE.with(|d| d.borrow().clone()) {
         return Ok(d);
@@ -138,19 +135,19 @@ fn ensure_device() -> windows::core::Result<(ID3D11Device, WinrtDevice)> {
     Ok(pair)
 }
 
-/// WinRT init + the `GraphicsCaptureAccess.RequestAccessAsync` handshake the
-/// original performs (`Windows.Graphics.Capture.GraphicsCaptureAccess`,
-/// `GraphicsCaptureAccessKind`, `graphicsCaptureWithoutBorder` in its binary).
-/// Without it `IGraphicsCaptureItemInterop::CreateForWindow` fails with
-/// `E_ACCESSDENIED (0x80070005)` for packaged (AppContainer) targets such as
-/// Notepad and Paint, which is why those windows produced no screenshot at
-/// all. Idempotent; runs once per process.
+/// WinRT 初始化，加上原版会做的 `GraphicsCaptureAccess.RequestAccessAsync`
+/// 握手（它二进制里有 `Windows.Graphics.Capture.GraphicsCaptureAccess`、
+/// `GraphicsCaptureAccessKind`、`graphicsCaptureWithoutBorder`）。少了这一步，
+/// 抓打包应用（AppContainer，比如记事本和画图）时
+/// `IGraphicsCaptureItemInterop::CreateForWindow` 会报
+/// `E_ACCESSDENIED (0x80070005)`，结果这些窗口一张截图都出不来。幂等，一个
+/// 进程只跑一次。
 fn ensure_capture_consent() {
     static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     DONE.get_or_init(|| {
         unsafe {
-            // WinRT activation wants RoInitialize on this thread; COM MTA alone
-            // is not always enough for the capture factories.
+            // WinRT 激活要求这个线程先 RoInitialize；单靠 COM MTA 对 capture
+            // 那些工厂不一定够。
             let hr = windows::Win32::System::WinRT::RoInitialize(
                 windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
             );
@@ -195,7 +192,7 @@ fn unwrap_surface(
     }
 }
 
-/// Copy one frame's BGRA bits into CPU memory.
+/// 把一帧的 BGRA 数据拷进 CPU 内存。
 fn copy_frame(device: &ID3D11Device, frame: &windows::Graphics::Capture::Direct3D11CaptureFrame)
     -> Result<Captured, String> {
     let surface = frame.Surface().map_err(|e| format!("frame surface: {e}"))?;
@@ -247,7 +244,7 @@ fn copy_frame(device: &ID3D11Device, frame: &windows::Graphics::Capture::Direct3
     Ok(out)
 }
 
-/// Build a pool + session for `item` and start it.
+/// 给 `item` 建 pool 和 session，然后开抓。
 fn start_session(
     winrt_device: &WinrtDevice,
     item: &GraphicsCaptureItem,
@@ -269,7 +266,7 @@ fn start_session(
     Ok((pool, session))
 }
 
-/// Drain every frame currently queued in the pool, keeping the newest.
+/// 把 pool 里排着的帧全取出来，只留最新那张。
 fn drain(device: &ID3D11Device, pool: &Direct3D11CaptureFramePool) -> Option<Captured> {
     let mut newest: Option<Captured> = None;
     for _ in 0..4 {
@@ -285,7 +282,7 @@ fn drain(device: &ID3D11Device, pool: &Direct3D11CaptureFramePool) -> Option<Cap
     newest
 }
 
-/// Poll the pool for up to `budget`, returning the newest frame seen.
+/// 在 `budget` 这段时间里反复问 pool，返回看到的最新一帧。
 fn poll(device: &ID3D11Device, pool: &Direct3D11CaptureFramePool, budget: Duration) -> Option<Captured> {
     let deadline = Instant::now() + budget;
     let mut best: Option<Captured> = None;
@@ -302,8 +299,8 @@ fn poll(device: &ID3D11Device, pool: &Direct3D11CaptureFramePool, budget: Durati
     best
 }
 
-/// Get one frame for `key`, reusing (and creating as needed) a cached session.
-/// `need_new` forces at least one poll for a frame produced by this call.
+/// 拿 `key` 的一帧：有缓存的 session 就复用，没有就新建。
+/// `need_new` 为真时至少轮询一次，要的是这次调用自己产出的帧。
 fn session_frame(
     key: isize,
     hwnd: HWND,
@@ -334,8 +331,8 @@ fn session_frame(
     }
     let mut entry = entry.ok_or("no capture session")?;
 
-    // The item's size follows the window; rebuild the pool when it changed
-    // (the original calls Direct3D11CaptureFramePool.Recreate for this).
+    // item 的尺寸跟着窗口走；尺寸一变就重建 pool（原版为此调
+    // Direct3D11CaptureFramePool.Recreate）。
     if let Ok(size) = entry.item.Size() {
         if size.Width > 0 && size.Height > 0 && (size.Width, size.Height) != entry.size {
             tr!("recreate pool hwnd={key} {:?} -> {:?}", entry.size, (size.Width, size.Height));
@@ -359,21 +356,21 @@ fn session_frame(
         }
     }
 
-    // 1. Anything already buffered in the pool?
+    // 1. pool 里已经攒着帧了吗？
     let mut frame = drain(&device, &entry.pool);
     if frame.is_some() {
         entry.last = frame.clone();
         entry.last_at = Instant::now();
     }
 
-    // 2. A frame younger than FRESH_ENOUGH is the answer.
+    // 2. 帧比 FRESH_ENOUGH 还新，那就是答案。
     let fresh = frame.is_some() && entry.last_at.elapsed() < FRESH_ENOUGH;
     if frame.is_none() {
         frame = entry.last.clone();
     }
     if !fresh {
         let have = frame.is_some();
-        // First frame ever: wait. Otherwise take a fresh one only briefly.
+        // 从来没拿到过帧就多等一会；已经有帧了，就只短暂等一下新的。
         let wait = if have {
             STALE_AFTER.min(budget)
         } else {
@@ -384,9 +381,8 @@ fn session_frame(
             entry.last = Some(f);
             entry.last_at = Instant::now();
         }
-        // 3. Still nothing at all: rebuild the session (a session created while
-        // the target is idle may simply never be handed a frame) and try once
-        // more before falling back to another surface.
+        // 3. 还是一帧都没有：重建 session（目标闲着的时候建的 session，可能
+        // 压根就没人给它发帧），再试一次，还不行才退到别的表面。
         if frame.is_none() && !have && Instant::now() < deadline {
             tr!("kick session hwnd={key}", );
             let _ = entry.session.Close();
@@ -413,7 +409,7 @@ fn session_frame(
     SESSIONS.with(|m| {
         let mut m = m.borrow_mut();
         if m.len() >= MAX_CACHED_SESSIONS {
-            // Drop the oldest-ish entry; sessions are cheap to rebuild.
+            // 扔掉一个差不多最老的；session 重建开销很小。
             if let Some(k) = m.keys().next().copied() {
                 if let Some(old) = m.remove(&k) {
                     let _ = old.session.Close();
@@ -425,7 +421,7 @@ fn session_frame(
     Ok(frame)
 }
 
-/// Crop a captured frame to a sub-rect (used by the desktop fallback).
+/// 把抓到的帧裁出一块（桌面兜底那条路会用到）。
 fn crop(src: &Captured, x: usize, y: usize, w: usize, h: usize) -> Result<Captured, String> {
     let x = x.min(src.w.saturating_sub(1));
     let y = y.min(src.h.saturating_sub(1));
@@ -443,14 +439,13 @@ fn crop(src: &Captured, x: usize, y: usize, w: usize, h: usize) -> Result<Captur
     Ok(Captured { w, h, row_pitch: (w * 4) as u32, px })
 }
 
-/// Screen rect of `hwnd` in the same *logical* px the original reports.
+/// `hwnd` 在屏幕上的矩形，用原版那套*逻辑*px 表示。
 ///
-/// Two things make this fiddly: the original measures the DWM extended frame
-/// bounds (`DwmGetWindowAttribute` in its strings) rather than the raw window
-/// rect, and whether `GetWindowRect` hands back physical or 96-dpi-virtualised
-/// px depends on the process DPI awareness — which is not knowable from here.
-/// The scale factor is therefore derived by comparing the rect against the
-/// WGC item size: `rect * scale == item` means the rect is already logical.
+/// 麻烦在两点。一是原版量的是 DWM 的扩展边框（它字符串里是
+/// `DwmGetWindowAttribute`），不是裸的窗口矩形。二是 `GetWindowRect` 返回的
+/// 到底是物理像素还是按 96 dpi 虚拟化过的像素，取决于进程的 DPI 感知设置，
+/// 而这事从这里看不出来。所以比例只能拿矩形去比 WGC item 的尺寸反推：
+/// `rect * scale == item` 就说明这个矩形本来就是逻辑像素。
 fn logical_rect(hwnd: HWND, scale: f64, item: (usize, usize)) -> (i32, i32, usize, usize) {
     let mut rect = RECT::default();
     let mut got_extended = false;
@@ -470,7 +465,7 @@ fn logical_rect(hwnd: HWND, scale: f64, item: (usize, usize)) -> (i32, i32, usiz
     }
     let rw = (rect.right - rect.left).max(1);
     let rh = (rect.bottom - rect.top).max(1);
-    // Already-virtualised (logical) rect when the item is `scale` times bigger.
+    // item 正好是矩形的 `scale` 倍，说明这个矩形已经是虚拟化过的逻辑像素。
     let logical_already = (rw as f64 * scale - item.0 as f64).abs()
         .min((rh as f64 * scale - item.1 as f64).abs())
         < (rw as f64 - item.0 as f64).abs().min((rh as f64 - item.1 as f64).abs());
@@ -486,12 +481,11 @@ fn logical_rect(hwnd: HWND, scale: f64, item: (usize, usize)) -> (i32, i32, usiz
     }
 }
 
-/// Capture options for a model-facing snapshot.
+/// 给模型看的 snapshot 用的抓图选项。
 ///
-/// `scale` is applied on top of the logical window pixels (1.0 = the original
-/// contract, 0.5 = half-size JPEG for token-starved turns). `region` crops the
-/// window in logical window-relative px, which is how a model asks for "just
-/// this panel" without paying for the whole window.
+/// `scale` 是在逻辑窗口像素之上再乘一次（1.0 = 原版契约，0.5 = 出半尺寸
+/// JPEG，token 吃紧的回合用）。`region` 按逻辑窗口相对 px 裁窗口，模型想
+/// “只看这一块”就靠它，不用为整个窗口付 token。
 #[derive(Clone, Copy)]
 pub struct CaptureOpts {
     pub scale: f64,
@@ -504,43 +498,42 @@ impl Default for CaptureOpts {
     }
 }
 
-/// One encoded screenshot: bytes plus the geometry a coordinate tool needs to
-/// map a pixel measured on this JPEG back to the screen.
+/// 一张编码好的截图：字节本身，外加坐标工具把这张 JPEG 上量到的像素换回
+/// 屏幕位置要用的几何信息。
 pub struct CapturedShot {
     pub jpeg: Vec<u8>,
-    /// JPEG pixel dimensions (already scaled/cropped).
+    /// JPEG 的像素尺寸（已经缩放/裁剪过）。
     pub width: usize,
     pub height: usize,
-    /// Screen origin of the captured region, in logical px (`originX/Y`).
+    /// 抓到的区域在屏幕上的原点，逻辑 px（就是 `originX/Y`）。
     pub origin_x: i32,
     pub origin_y: i32,
-    /// Captured-region offset inside the window, logical px.
+    /// 抓的这一块在窗口内部的偏移，逻辑 px。
     pub offset_x: i32,
     pub offset_y: i32,
-    /// JPEG px per logical window px (1.0 unless a `scale` was requested).
+    /// 一个逻辑窗口 px 折几个 JPEG px（没传 `scale` 时就是 1.0）。
     pub scale: f64,
 }
 
-/// Capture one frame of `hwnd`; returns (jpeg bytes, width, height).
+/// 抓 `hwnd` 的一帧，返回 (jpeg 字节, 宽, 高)。
 ///
-/// Width/height are the *logical* px the original reports (and the JPEG's own
-/// pixel dimensions), i.e. the physical WGC frame divided by the window's DPI
-/// scale.
+/// 宽高是原版报的那套*逻辑*px（也是 JPEG 自己的像素尺寸），也就是物理 WGC
+/// 帧除以窗口的 DPI 比例。
 pub fn capture_window_jpeg(hwnd: HWND) -> Result<(Vec<u8>, usize, usize), String> {
     let shot = capture_window_shot(hwnd, CaptureOpts::default())?;
     Ok((shot.jpeg, shot.width, shot.height))
 }
 
-/// As [`capture_window_jpeg`], plus the screen origin of the captured region
-/// in the same logical px the original reports in `originX`/`originY`.
-#[allow(dead_code)] // kept for callers that still want the tuple form
+/// 跟 [`capture_window_jpeg`] 一样，另外带上抓的那块区域的原点，用的还是
+/// 原版在 `originX`/`originY` 里报的逻辑 px。
+#[allow(dead_code)] // 留给还想要元组形式的调用方
 pub fn capture_window_jpeg_ex(hwnd: HWND) -> Result<(Vec<u8>, usize, usize, i32, i32), String> {
     let shot = capture_window_shot(hwnd, CaptureOpts::default())?;
     Ok((shot.jpeg, shot.width, shot.height, shot.origin_x, shot.origin_y))
 }
 
-/// Capture `hwnd` honoring [`CaptureOpts`]: optional logical-px crop and a
-/// post-crop downscale, with the geometry needed to undo both.
+/// 按 [`CaptureOpts`] 抓 `hwnd`：可选先按逻辑 px 裁一刀，裁完再降采样，同时
+/// 给出把这两步都还原回去所需的几何信息。
 pub fn capture_window_shot(hwnd: HWND, opts: CaptureOpts) -> Result<CapturedShot, String> {
     let started = Instant::now();
     let mut rect = RECT::default();
@@ -573,9 +566,9 @@ pub fn capture_window_shot(hwnd: HWND, opts: CaptureOpts) -> Result<CapturedShot
     let frame = match session_frame(key, hwnd, FIRST_FRAME_BUDGET + KICK_BUDGET, true) {
         Ok(f) => f,
         Err(e) => {
-            // Last-resort surface: the desktop window cropped to the target
-            // rect. Matches the original's "no desktop window" fallback path
-            // and still yields pixels for a window whose item never paints.
+            // 最后的退路：抓整个桌面窗口，再按目标矩形裁。这跟原版
+            // "no desktop window" 那条兜底路径对得上；窗口 item 一直不画，
+            // 这样也还能拿到像素。
             tr!("window capture failed hwnd={key}: {e}; trying desktop fallback");
             let desktop = unsafe { GetDesktopWindow() };
             if !unsafe { IsWindowVisible(hwnd).as_bool() } {
@@ -599,11 +592,11 @@ pub fn capture_window_shot(hwnd: HWND, opts: CaptureOpts) -> Result<CapturedShot
         return Err("captured frame too small".into());
     }
 
-    // The original reports/serves logical pixels: physical frame / DPI scale.
+    // 原版报的、发的都是逻辑像素：物理帧除以 DPI 比例。
     let logical_w = ((frame.w as f64) / scale).round().max(1.0) as usize;
     let logical_h = ((frame.h as f64) / scale).round().max(1.0) as usize;
 
-    // Optional logical-px crop, clamped to the window.
+    // 可选按逻辑 px 裁，范围不能超出窗口。
     let (rx, ry, rw, rh) = match opts.region {
         None => (0, 0, logical_w, logical_h),
         Some((x, y, w, h)) => {
@@ -622,8 +615,8 @@ pub fn capture_window_shot(hwnd: HWND, opts: CaptureOpts) -> Result<CapturedShot
     let target_w = ((rw as f64) * out_scale).round().max(1.0) as usize;
     let target_h = ((rh as f64) * out_scale).round().max(1.0) as usize;
 
-    // Cropping happens on the physical frame so the downscale is a single WIC
-    // pass; the crop is the requested logical region times the DPI factor.
+    // 在物理帧上裁，这样降采样只用走一趟 WIC；裁的位置是请求的逻辑区域乘
+    // DPI 比例。
     let px = ((rx as f64) * scale).round() as usize;
     let py = ((ry as f64) * scale).round() as usize;
     let pw = (((rw as f64) * scale).round() as usize).max(1);
@@ -653,7 +646,7 @@ pub fn capture_window_shot(hwnd: HWND, opts: CaptureOpts) -> Result<CapturedShot
     })
 }
 
-/// BGRA rows → JPEG via WIC, scaled to the reported logical size.
+/// 把 BGRA 行数据经 WIC 转成 JPEG，缩到报出去的那个逻辑尺寸。
 fn encode_jpeg(frame: &Captured, target_w: usize, target_h: usize) -> Result<Vec<u8>, String> {
     let (width, height) = (frame.w, frame.h);
     let row_pitch = frame.row_pitch as usize;
@@ -673,7 +666,7 @@ fn encode_jpeg(frame: &Captured, target_w: usize, target_h: usize) -> Result<Vec
                 windows::Win32::Graphics::Imaging::WICBitmapCacheOnLoad,
             )
             .map_err(|e| format!("wic bitmap: {e}"))?;
-        // Lock and copy row by row (row pitch may exceed width*4).
+        // 锁住之后一行一行拷（row pitch 可能比 width*4 大）。
         {
             use windows::Win32::Graphics::Imaging::{IWICBitmapLock, WICBitmapLockWrite};
             let rect = windows::Win32::Graphics::Imaging::WICRect {
@@ -702,9 +695,8 @@ fn encode_jpeg(frame: &Captured, target_w: usize, target_h: usize) -> Result<Vec
                 std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(y * lock_pitch), row_bytes);
             }
         }
-        // Scale physical capture px → the logical px the helper reports, so a
-        // 200% display produces the same ~170 KB payload as the original
-        // instead of a 4x larger one.
+        // 把物理抓图的像素缩成 helper 报的逻辑像素。不然 200% 缩放的屏幕上
+        // 出的包比原版大 4 倍，缩完才跟原版一样是 ~170 KB。
         let source: windows::Win32::Graphics::Imaging::IWICBitmapSource = if (width, height)
             != (target_w, target_h)
         {
@@ -758,13 +750,12 @@ fn encode_jpeg(frame: &Captured, target_w: usize, target_h: usize) -> Result<Vec
             .map_err(|e| format!("write: {e}"))?;
         frameenc.Commit().map_err(|e| format!("commit: {e}"))?;
         encoder.Commit().map_err(|e| format!("enc commit: {e}"))?;
-        // `IWICStream::Stat` over an InitializeFromMemory buffer reports the
-        // *buffer* length, not the encoded length — trusting it returned the
-        // whole 32 MiB scratch buffer (a real JPEG plus zero padding), i.e. a
-        // 44,739,244-char data URL, which is what the Harness viewer reported
-        // as `image/jpeg; Maximum call stack size exceeded`. Derive the true
-        // end from the data: a JPEG always terminates with FFD9, so everything
-        // after the last non-zero byte is padding.
+        // 用 InitializeFromMemory 建出来的流，`IWICStream::Stat` 报的是*缓冲
+        // 区*长度，不是编码后的长度。信了它就会把整个 32 MiB 草稿区全返回
+        // 出去（真 JPEG 后面跟着一堆 0），拼成 44,739,244 字符的 data URL，
+        // 结果 Harness 看图那边报
+        // `image/jpeg; Maximum call stack size exceeded`。所以长度只能从数据
+        // 本身推：JPEG 结尾一定是 FFD9，最后一个非零字节之后的全是填充。
         let last = buf.iter().rposition(|b| *b != 0).map(|i| i + 1).unwrap_or(0);
         if last < 2 || buf[last - 2..last] != [0xff, 0xd9] {
             let mut stat = windows::Win32::System::Com::STATSTG::default();

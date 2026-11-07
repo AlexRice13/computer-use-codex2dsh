@@ -1,12 +1,12 @@
-// sky-engine — behavior-compatible open reimplementation of the Sky
-// computer-use helper (codex-computer-use.exe), per SKY_WINDOWS_PROTOCOL_SPEC.
+// sky-engine——按 SKY_WINDOWS_PROTOCOL_SPEC 重写的 Sky computer-use helper
+// （原版叫 codex-computer-use.exe），行为跟原版对齐。
 //
-// Startup contract (observed, replicated exactly):
+// 启动约定（照原版观察到的来，一步不差）：
 //   spawn(exe, ["--parent-pid", <hostPid>], { cwd: stageDir,
 //     env: { CODEX_HOME, CODEX_CLI_PATH, ... } })
-//   - line-delimited JSON-RPC over stdin/stdout
-//   - blocks on the `codex app-server` handshake (CODEX_CLI_PATH) before serving
-//   - dies with the parent pid; exit 130 on physical Escape (phase 6)
+//   - stdin/stdout 上走一行一个的 JSON-RPC
+//   - 没跟 `codex app-server` 握手完（CODEX_CLI_PATH）就不开始处理请求
+//   - 父进程 pid 死了跟着退；物理 Esc 退出码 130（第 6 阶段）
 
 mod args;
 mod catalog;
@@ -24,9 +24,9 @@ mod win;
 
 use std::process::ExitCode;
 
-/// The host spawns us with a stripped environment (CODEX_HOME, CODEX_CLI_PATH
-/// only). Fill in the basics Windows APIs (ShellExecute, child processes,
-/// PowerShell) expect, without overwriting anything already set.
+/// 宿主起我们时把环境变量清得只剩 CODEX_HOME 和 CODEX_CLI_PATH。这里把
+/// Windows API（ShellExecute、子进程、PowerShell）要用的几个基础变量补上，
+/// 已经有的不覆盖。
 fn harden_env() {
     let sysroot = std::env::var("SystemRoot")
         .or_else(|_| std::env::var("SYSTEMROOT"))
@@ -49,11 +49,11 @@ fn harden_env() {
         let tmp = std::env::var("LOCALAPPDATA")
             .map(|l| format!("{l}\\Temp"))
             .unwrap_or_else(|_| {
-                // Ask the shell; works with no env at all.
+                // 问 shell 要；一个环境变量都没有也问得出来。
                 use windows::Win32::UI::Shell::SHGetFolderPathW;
                 let mut buf = [0u16; windows::Win32::Foundation::MAX_PATH as usize];
                 unsafe {
-                    if SHGetFolderPathW(None, 28 /* CSIDL_LOCAL_APPDATA */, None, 0, &mut buf)
+                    if SHGetFolderPathW(None, 28 /* CSIDL_LOCAL_APPDATA，本地 AppData 目录 */, None, 0, &mut buf)
                         .is_ok()
                     {
                         let len = buf.iter().position(|c| *c == 0).unwrap_or(0);
@@ -71,9 +71,9 @@ fn harden_env() {
             std::env::set_var("TMP", &tmp);
         }
     }
-    // Profile-scoped folders: PowerShell's Get-StartApps and the shell's
-    // per-user AppModel views silently degrade to almost nothing without
-    // USERPROFILE/APPDATA/LOCALAPPDATA.
+    // 用户目录相关的变量：少了 USERPROFILE/APPDATA/LOCALAPPDATA，
+    // PowerShell 的 Get-StartApps 和 shell 的 per-user AppModel 视图会
+    // 悄悄退化到几乎查不出东西。
     {
         use windows::Win32::UI::Shell::SHGetFolderPathW;
         let shell_folder = |csidl: i32| -> Option<String> {
@@ -85,17 +85,17 @@ fn harden_env() {
             }
         };
         if std::env::var_os("USERPROFILE").is_none() {
-            if let Some(p) = shell_folder(40 /* CSIDL_PROFILE */) {
+            if let Some(p) = shell_folder(40 /* CSIDL_PROFILE，用户主目录 */) {
                 std::env::set_var("USERPROFILE", p);
             }
         }
         if std::env::var_os("APPDATA").is_none() {
-            if let Some(p) = shell_folder(26 /* CSIDL_APPDATA */) {
+            if let Some(p) = shell_folder(26 /* CSIDL_APPDATA，漫游 AppData 目录 */) {
                 std::env::set_var("APPDATA", p);
             }
         }
         if std::env::var_os("LOCALAPPDATA").is_none() {
-            if let Some(p) = shell_folder(28 /* CSIDL_LOCAL_APPDATA */) {
+            if let Some(p) = shell_folder(28 /* CSIDL_LOCAL_APPDATA，本地 AppData 目录 */) {
                 std::env::set_var("LOCALAPPDATA", p);
             }
         }
@@ -108,15 +108,15 @@ fn harden_env() {
 }
 
 fn main() -> ExitCode {
-    // The original helper is a per-monitor DPI-aware process: UIA rectangles
-    // and SendInput coordinates are physical pixels.
+    // 原版 helper 是 per-monitor DPI-aware 进程：UIA 给的矩形、SendInput 收的
+    // 坐标，都是物理像素。
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
     }
     harden_env();
-    // Private debug modes (not part of the RPC contract).
+    // 私有调试模式，不在 RPC 契约里。
     {
         let argv: Vec<String> = std::env::args().collect();
         if argv.get(1).map(String::as_str) == Some("--wins") {
@@ -131,7 +131,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
-    // Private debug mode (not part of the RPC contract): capture one frame.
+    // 私有调试模式（不在 RPC 契约里）：单抓一帧。
     {
         let argv: Vec<String> = std::env::args().collect();
         if argv.get(1).map(String::as_str) == Some("--capture") {
@@ -157,9 +157,9 @@ fn main() -> ExitCode {
     let parsed = match args::parse_args() {
         Ok(args::Invocation::Rpc(opts)) => opts,
         Ok(args::Invocation::CursorManager) => {
-            // The proprietary helper re-execs itself as a system-cursor
-            // manager child. v1 drives the real cursor and has no overlay,
-            // so this mode is a no-op that exits immediately.
+            // 原版那个闭源 helper 会再起一个自己当 system-cursor manager
+            // 子进程。v1 直接驱真光标，没有 overlay，所以这个模式什么都不做，
+            // 立刻退出。
             return ExitCode::SUCCESS;
         }
         Err(e) => {

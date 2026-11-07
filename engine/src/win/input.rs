@@ -1,6 +1,5 @@
-// Synthetic input via SendInput: typing, key combinations, mouse moves,
-// clicks, wheel and drag. Coordinates arrive already in screen space
-// (the tool layer adds the snapshot origin before calling in).
+// 合成输入都走 SendInput：打字、按键组合、鼠标移动、点击、滚轮、拖拽。
+// 传进来的坐标已经是屏幕坐标（工具层调进来之前会先加上 snapshot 原点）。
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -15,8 +14,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE,
 };
 
-/// Bring a window forward before delivering input (the harness contract
-/// requires an explicit activate; helpers on top still call this defensively).
+/// 发输入之前先把窗口提到前台（harness 契约要求显式 activate；上层 helper
+/// 还是会自己再调一次，防一手）。
 pub fn activate(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -74,7 +73,7 @@ fn key(vk: u16, flags: KEYBD_EVENT_FLAGS, scan: u16) {
     }
 }
 
-/// Type literal text: one VK_PACKET event per UTF-16 code unit.
+/// 原样打字：每个 UTF-16 码元发一个 VK_PACKET 事件。
 pub fn type_text(text: &str) -> usize {
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut sent = 0usize;
@@ -174,15 +173,15 @@ fn vk_for_token(tok: &str) -> Option<u16> {
     let chars: Vec<char> = tok.chars().collect();
     if chars.len() == 1 {
         let c = chars[0];
-        // The virtual-key codes for A-Z and 0-9 are their ASCII codes, so
-        // alphanumeric keys need no keyboard-layout lookup at all.
+        // A-Z 和 0-9 的虚拟键码就是它们的 ASCII 码，所以字母数字这些键
+        // 根本不用查键盘布局。
         if c.is_ascii_alphabetic() {
             return Some(c.to_ascii_uppercase() as u16);
         }
         if c.is_ascii_digit() {
             return Some(c as u16);
         }
-        // Symbols route through VkKeyScanW with the thread layout.
+        // 符号走 VkKeyScanW，按当前线程的键盘布局查。
         let code = {
             let mut buf = [0u16; 2];
             c.encode_utf16(&mut buf);
@@ -204,7 +203,7 @@ fn is_modifier_token(tok: &str) -> bool {
     MODIFIERS.iter().any(|(n, _)| *n == t)
 }
 
-/// Press a key or combination: "ctrl+shift+s", "Enter", "F5", "space".
+/// 按一个键或者一串组合键："ctrl+shift+s"、"Enter"、"F5"、"space"。
 pub fn press_key(combo: &str) -> Result<(), String> {
     let toks: Vec<String> = combo
         .split('+')
@@ -214,7 +213,7 @@ pub fn press_key(combo: &str) -> Result<(), String> {
     if toks.is_empty() {
         return Err("invalid key combination".into());
     }
-    // The last token is the action key; leading tokens are modifiers.
+    // 最后一个 token 才是真正按的键，前面的都当修饰键。
     let mut mods: Vec<u16> = Vec::new();
     let mut action: Option<u16> = None;
     for (i, t) in toks.iter().enumerate() {
@@ -226,7 +225,7 @@ pub fn press_key(combo: &str) -> Result<(), String> {
                 mods.push(vk);
             }
         } else {
-            // Non-modifier in the middle: still treat as part of the chord.
+            // 中间夹了个非修饰键：还是算在这串组合里。
             action = action.or(Some(vk));
         }
     }
@@ -264,7 +263,7 @@ pub fn click(x: i32, y: i32, button: Button, count: u32) {
 }
 
 pub fn wheel(x: i32, y: i32, scroll_x: i32, scroll_y: i32) {
-    // Move the cursor first so the wheel events target the right surface.
+    // 先把光标移过去，滚轮事件才会落在该落的那个面上。
     mouse(x, y, MOUSEEVENTF_MOVE, 0);
     if scroll_y != 0 {
         mouse(x, y, MOUSEEVENTF_WHEEL, (scroll_y.saturating_mul(120)) as u32);
@@ -274,13 +273,12 @@ pub fn wheel(x: i32, y: i32, scroll_x: i32, scroll_y: i32) {
     }
 }
 
-/// Press, move and release the left button.
+/// 按下左键、移动、再松开。
 ///
-/// Distance-proportional interpolation matters: a long drag (a shape or a
-/// selection in Paint) only commits when the target sees enough
-/// `WM_MOUSEMOVE` samples *and* a settle before `MOUSEEVENTF_LEFTUP`. The old
-/// fixed 12 steps with no delay left long drags as a live rubber-band preview
-/// (the target never saw the button come up as a completed gesture).
+/// 按距离插值这一步不能省：长拖拽（画图里画个形状、拉个选区）要目标窗口收到
+/// 足够多的 `WM_MOUSEMOVE` 采样，而且在 `MOUSEEVENTF_LEFTUP` 之前稳一下才肯
+/// 提交。以前固定走 12 步、中间不加延时，长拖拽就一直是橡皮筋预览
+/// （目标根本没等到一次完整手势的抬键）。
 pub fn drag(from: (i32, i32), to: (i32, i32)) {
     mouse(from.0, from.1, MOUSEEVENTF_MOVE, 0);
     std::thread::sleep(std::time::Duration::from_millis(15));
@@ -292,15 +290,14 @@ pub fn drag(from: (i32, i32), to: (i32, i32)) {
     let steps = ((distance / 6.0).ceil() as i64).clamp(12, 96);
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
-        // Ease in/out so the first and last pixels are not skipped.
+        // 缓入缓出，免得首尾那几个像素被跳过。
         let e = t * t * (3.0 - 2.0 * t);
         let x = (from.0 as f64 + dx * e).round() as i32;
         let y = (from.1 as f64 + dy * e).round() as i32;
         mouse(x, y, MOUSEEVENTF_MOVE, 0);
         std::thread::sleep(std::time::Duration::from_millis(4));
     }
-    // Land exactly on the target and hold briefly so the target processes the
-    // final move before the release.
+    // 精确落到目标点上，再停一下，让目标先把最后一次移动处理完再抬键。
     mouse(to.0, to.1, MOUSEEVENTF_MOVE, 0);
     std::thread::sleep(std::time::Duration::from_millis(40));
     mouse(to.0, to.1, MOUSEEVENTF_LEFTUP, 0);
@@ -350,8 +347,8 @@ mod tests {
 
     #[test]
     fn combo_rejects_unknown_key_without_injecting() {
-        // The parser runs before any SendInput call, so an unknown token is
-        // an error and nothing reaches the desktop.
+        // 解析在任何 SendInput 之前跑完，所以遇到不认识的 token 直接报错，
+        // 一个事件都不会落到桌面上。
         assert!(press_key("ctrl+not-a-key").is_err());
         assert!(press_key("").is_err());
     }

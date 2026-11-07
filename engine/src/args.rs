@@ -7,9 +7,9 @@ pub enum Invocation {
     CursorManager,
 }
 
-/// argv: `--parent-pid <pid>` is required on the RPC path (die-with-parent
-/// watchdog). `--system-cursor-manager` is the cursor-manager re-exec mode.
-/// Unknown argv → `unknown argument: <a>` (exe literal).
+/// 走 RPC 这条路时 `--parent-pid <pid>` 必填（看门狗，父进程一死就退出）。
+/// `--system-cursor-manager` 是原版把自己重启成光标管理器时用的模式。
+/// 不认识的参数一律回 `unknown argument: <a>`（原版 exe 里就是这个字）。
 pub fn parse_args() -> Result<Invocation, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut parent_pid: Option<u32> = None;
@@ -30,8 +30,8 @@ pub fn parse_args() -> Result<Invocation, String> {
             }
             "--system-cursor-manager" => cursor_manager = true,
             "--previous-notify" => {
-                // Codex CLI notify integration: `--previous-notify <json>`.
-                // A Node host never uses it; accept and drop.
+                // Codex CLI 的 notify 衔接参数：`--previous-notify <json>`。
+                // Node 宿主根本不用它，收下就丢。
                 if i >= argv.len() {
                     return Err("missing value for --previous-notify".into());
                 }

@@ -20,7 +20,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
 
-/// PKEY_AppUserModel_ID — {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3} pid 26.
+/// PKEY_AppUserModel_ID —— {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}，pid 26。
 const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
     fmtid: GUID::from_u128(0x9F4C2855_9F79_4B39_A8D0_E1D42DE1D5F3),
     pid: 26,
@@ -62,8 +62,8 @@ pub fn extended_bounds(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// SHGetPropertyStoreForWindow — the windows 0.61 binding omits the dwFlags
-/// parameter (corrupt x64 call), so declare and load it correctly.
+/// SHGetPropertyStoreForWindow —— windows 0.61 的绑定漏了 dwFlags 参数，x64
+/// 下调用会把栈搞坏，所以这里自己声明，自己从 shell32 里取。
 type GPSFW = unsafe extern "system" fn(
     HWND,
     *const windows::core::GUID,
@@ -79,18 +79,18 @@ fn gpsfw() -> Option<GPSFW> {
     }
 }
 
-/// AUMID for a packaged window via the shell property store.
+/// 打包应用的窗口，从 shell 属性仓库里取它的 AUMID。
 pub fn window_aumid(hwnd: HWND) -> Option<String> {
     if let Some(a) = aumid_of(hwnd) {
         return Some(a);
     }
-    // ILaunchSourceAppUserModelId (taskbar launch info) covers Electron /
-    // relauncher apps whose windows carry no PKEY (e.g. com.deepseek.dsh).
+    // ILaunchSourceAppUserModelId（任务栏的启动信息）能补上 Electron 和转发
+    // 启动器这类窗口没有 PKEY 的应用（比如 com.deepseek.dsh）。
     if let Some(a) = launch_source_aumid(hwnd) {
         return Some(a);
     }
-    // ApplicationFrameHost-hosted UWP frames carry the AUMID on the hosted
-    // child window instead; walk children until one yields it.
+    // 由 ApplicationFrameHost 托管的 UWP 窗口，AUMID 挂在被托管的子窗口上，
+    // 所以挨个走子窗口，谁给得出来就用谁。
     use windows::Win32::UI::WindowsAndMessaging::EnumChildWindows;
     unsafe extern "system" fn cb(child: HWND, lparam: windows::Win32::Foundation::LPARAM) -> windows::core::BOOL {
         let slot = &mut *(lparam.0 as *mut Option<String>);
@@ -125,7 +125,7 @@ fn aumid_of(hwnd: HWND) -> Option<String> {
         let inner = &*var.Anonymous.Anonymous;
         let vt = inner.vt;
         let mut out = None;
-        // VT_LPWSTR == 31
+        // VT_LPWSTR 的值是 31
         if vt == VARENUM(31) {
             let pw = inner.Anonymous.pwszVal.0;
             if !pw.is_null() {
@@ -189,8 +189,8 @@ pub fn process_image_path(pid: u32) -> Option<String> {
     }
 }
 
-/// Host/shell processes that never provide a window's own identity (the real
-/// helper keeps the same list — its strings name each of these).
+/// 这些宿主/壳进程从来不代表窗口自己的身份（真 helper 里是同一份名单，它
+/// 的字符串里一个个都出现过）。
 pub const EXCLUDED_HOST_PROCESSES: &[&str] = &[
     "applicationframehost.exe",
     "backgroundtaskhost.exe",
@@ -215,20 +215,19 @@ fn is_excluded_host_process(image_path: &str) -> bool {
         .any(|e| name.eq_ignore_ascii_case(e))
 }
 
-/// Window identity (spec §C.1): AUMID when the shell stamped one on the
-/// window (property store), otherwise the synthesized `process:<image path>`
-/// identifier. Store-path processes without package identity and shell host
-/// processes are unresolvable (the real helper skips them too).
+/// 窗口身份（spec §C.1）：shell 往窗口上盖了 AUMID 就用 AUMID（走属性仓
+/// 库），没有就用拼出来的 `process:<image path>`。装在商店目录下但没包身份
+/// 的进程、以及壳宿主进程，都认不出来（真 helper 也跳过它们）。
 pub fn app_id_for_window(hwnd: HWND, pid: u32) -> Option<String> {
     if let Some(aumid) = window_aumid(hwnd) {
         return Some(aumid);
     }
     let path = process_image_path(pid)?;
     let name = path.rsplit('\\').next().unwrap_or("").to_lowercase();
-    // Chromium-family browsers are identified by product token, not path
-    // (measured: Chrome window app = "Chrome", Edge window app = "MSEdge").
-    // The whitelist order (chrome/msedge/brave/opera) matches the original
-    // binary's embedded exe list.
+    // Chromium 系浏览器按产品名认，不按路径（实测：Chrome 窗口的 app 是
+    // "Chrome"，Edge 窗口的是 "MSEdge"）。
+    // 白名单顺序（chrome/msedge/brave/opera）跟原版二进制里内嵌的 exe 名单
+    // 一致。
     match name.as_str() {
         "chrome.exe" => return Some("Chrome".into()),
         "msedge.exe" => return Some("MSEdge".into()),
@@ -237,14 +236,13 @@ pub fn app_id_for_window(hwnd: HWND, pid: u32) -> Option<String> {
         _ => {}
     }
     if path.to_lowercase().contains("\\windowsapps\\") {
-        // Packaged (UWP/WinUI3) app window: derive the AUMID from the
-        // process's package identity (measured: modern Notepad windows are
-        // reported by the original as their AUMID even when the window has
-        // no shell AUMID property).
+        // 打包应用（UWP/WinUI3）的窗口：从进程的包身份推出 AUMID（实测：
+        // 现在的记事本窗口，就算窗口上没有 shell 的 AUMID 属性，原版也报它
+        // 的 AUMID）。
         if let Some(full) = package_full_name_for_pid(pid) {
-            // Terminal-family windows are excluded on purpose (the original
-            // names the WindowsTerminal AUMID next to its terminal-token
-            // list: conhost/fluentterminal/git-bash/hyperkit/wsl/wt).
+            // 终端这一类窗口是故意排除的。原版把 WindowsTerminal 的 AUMID
+            // 和它的终端 token 名单摆在一起：conhost/fluentterminal/
+            // git-bash/hyperkit/wsl/wt。
             if full.to_lowercase().starts_with("microsoft.windowsterminal_") {
                 return None;
             }
@@ -260,7 +258,7 @@ pub fn app_id_for_window(hwnd: HWND, pid: u32) -> Option<String> {
     Some(format!("process:{path}"))
 }
 
-/// Package full name of a process (None for unpackaged processes).
+/// 进程的包全名（没打包的进程返回 None）。
 pub fn package_full_name_for_pid(pid: u32) -> Option<String> {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
@@ -312,7 +310,7 @@ pub fn package_full_name_for_pid(pid: u32) -> Option<String> {
     }
 }
 
-/// Package full name → application ids → main AUMID (prefer `…!App`).
+/// 包全名 → 应用 id → 主 AUMID（优先 `…!App` 那个）。
 pub fn aumid_from_package_full_name(full_name: &str) -> Option<String> {
     use windows::Win32::Storage::Packaging::Appx::{
         ClosePackageInfo, GetPackageApplicationIds, OpenPackageInfoByFullName,
@@ -331,7 +329,7 @@ pub fn aumid_from_package_full_name(full_name: &str) -> Option<String> {
         }
         let mut size = 0u32;
         let mut id_count = 0u32;
-        // Size queries return ERROR_INSUFFICIENT_BUFFER (122) normally.
+        // 探大小的调用一般返回 ERROR_INSUFFICIENT_BUFFER (122)。
         let qrc = GetPackageApplicationIds(reference as *const _, &mut size, None, Some(&mut id_count));
         if trace {
             eprintln!("[trace] GetPackageApplicationIds query rc={qrc:?} size={size} count={id_count}");
@@ -342,8 +340,8 @@ pub fn aumid_from_package_full_name(full_name: &str) -> Option<String> {
             let mut buf = vec![0u8; size as usize];
             let rrc = GetPackageApplicationIds(reference as *const _, &mut size, Some(buf.as_mut_ptr()), Some(&mut id_count));
             if rrc.is_ok() || rrc.0 == 122 {
-                // Layout (observed on win11 24H2): u64 reference header, then
-                // NUL-terminated UTF-16 application ids back to back.
+                // 内存布局（在 win11 24H2 上看到的）：开头一个 u64 的
+                // reference，后面是首尾相接、NUL 结尾的 UTF-16 应用 id。
                 let mut ids: Vec<String> = Vec::new();
                 let mut cur: Vec<u16> = Vec::new();
                 for c in buf[8.min(buf.len())..].chunks_exact(2) {
@@ -363,7 +361,7 @@ pub fn aumid_from_package_full_name(full_name: &str) -> Option<String> {
                 if trace {
                     eprintln!("[trace] app ids: {ids:?}");
                 }
-                // Prefer the main app id (…!App style), else first.
+                // 优先主应用 id（…!App 那种），没有就取第一个。
                 out = ids
                     .iter()
                     .find(|id| id.rsplit('!').next().unwrap_or("").eq_ignore_ascii_case("App"))
@@ -376,15 +374,14 @@ pub fn aumid_from_package_full_name(full_name: &str) -> Option<String> {
     }
 }
 
-/// AUMID of a packaged process (AFH-hosted UWP content processes), via
-/// package full name → application ids.
+/// 打包进程（AFH 托管的 UWP 内容进程）的 AUMID，走包全名 → 应用 id。
 pub fn aumid_for_hosted_pid(pid: u32) -> Option<String> {
     let full = package_full_name_for_pid(pid)?;
     aumid_from_package_full_name(&full)
 }
 
-/// Human-facing app name: shell display name for packaged apps, product
-/// name for exes, exe stem as last resort.
+/// 给人看的应用名：打包应用用 shell 显示名，exe 用产品名，最后才退回 exe
+/// 的主文件名。
 pub fn app_display_name(app_id: &str) -> String {
     if looks_like_aumid(app_id) {
         if let Some(name) = aumid_display_name(app_id) {
@@ -392,16 +389,16 @@ pub fn app_display_name(app_id: &str) -> String {
         }
     }
     let path = app_id.strip_prefix("process:").unwrap_or(app_id);
-    // The shell display name wins: it matches the Start-menu branding the
-    // helper reports ("TechPowerUp GPU-Z", localized names, …).
+    // shell 显示名优先：它跟 helper 报出来的开始菜单品牌名一致（比如
+    // "TechPowerUp GPU-Z"、本地化过的名字，等等）。
     if let Some(item) = shell_item_for(path) {
         if let Ok(name) = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) } {
             if !name.0.is_null() {
                 let s = unsafe { name.to_string().unwrap_or_default() };
                 let s = s.trim();
                 if !s.is_empty() {
-                    // The parser-based display keeps the extension; the
-                    // helper's names never carry it.
+                    // 解析出来的显示名带着扩展名。helper 报的名字从来不带，
+                    // 所以这里砍掉。
                     if s.len() > 4 && s.to_lowercase().ends_with(".exe") {
                         return s[..s.len() - 4].to_string();
                     }
@@ -419,14 +416,14 @@ pub fn app_display_name(app_id: &str) -> String {
         .unwrap_or_else(|| app_id.to_string())
 }
 
-/// SHCreateItemFromParsingName helper shared by display-name lookups.
+/// 查显示名共用的 SHCreateItemFromParsingName 小工具。
 fn shell_item_for(path: &str) -> Option<IShellItem> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok() }
 }
 
 pub fn looks_like_aumid(id: &str) -> bool {
-    // Package family style: e.g. Microsoft.WindowsNotepad_8wekyb3d8bbwe!App
+    // 包族那种形式，比如 Microsoft.WindowsNotepad_8wekyb3d8bbwe!App
     (id.contains('_') && id.contains('!')) || id.starts_with("windows.")
 }
 
@@ -445,7 +442,7 @@ fn aumid_display_name(aumid: &str) -> Option<String> {
     }
 }
 
-/// VS_VERSION_INFO ProductName (best effort).
+/// 从 VS_VERSION_INFO 里取 ProductName，尽力而为。
 pub fn product_name(exe_path: &str) -> Option<String> {
     let wide: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -488,5 +485,5 @@ pub fn product_name(exe_path: &str) -> Option<String> {
     }
 }
 
-/// Exposed so the catalog can load .lnk files through CoCreateInstance.
+/// 暴露出来，目录那边才能用 CoCreateInstance 加载 .lnk 文件。
 pub const CLSID_SHELL_LINK: GUID = GUID::from_u128(0x00021401_0000_0000_C000_000000000046);

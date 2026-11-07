@@ -1,17 +1,16 @@
-//! Start-menu application catalog.
+//! 开始菜单应用清单。
 //!
-//! The shell "AppsFolder" namespace (what Get-StartApps enumerates) is the
-//! helper's curated application source. Namespace handlers refuse to bind
-//! from this process's COM context, so the catalog is fetched through
-//! PowerShell once per half hour and kept in a small on-disk cache; list
-//! responses after the first call never touch the shell again.
+//! 应用来源就是 shell 的 "AppsFolder" 命名空间（Get-StartApps 列的那一套）。
+//! 这个命名空间的 handler 不肯从当前进程的 COM 上下文里绑定，所以清单改从
+//! PowerShell 拿，半小时一次，结果存一份小的磁盘缓存；第一次之后的
+//! list 响应就不会再碰 shell。
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 
-/// (display name, application id) pairs as reported by Get-StartApps.
+/// Get-StartApps 报出来的 (显示名, 应用 id) 对。
 pub fn collect() -> Vec<(String, String)> {
     let cache = cache_path();
     if let Some(entries) = read_cache(&cache) {
@@ -22,8 +21,7 @@ pub fn collect() -> Vec<(String, String)> {
             write_cache(&cache, &entries);
             entries
         }
-        // Fall back to the previous cache even when stale; better than an
-        // empty catalog when PowerShell is unavailable.
+        // PowerShell 用不了时，过期的旧缓存也接着用，总比给个空清单强。
         None => read_cache_any(&cache).unwrap_or_default(),
     }
 }
@@ -83,9 +81,8 @@ fn write_cache(path: &PathBuf, entries: &[(String, String)]) {
 }
 
 fn fetch() -> Option<Vec<(String, String)>> {
-    // Mirror the taskbar probe: PowerShell writes the JSON into a temp file
-    // instead of piping stdout, which is the capture mode proven reliable
-    // across the host/parent process chains.
+    // 跟任务栏那个探测一个套路：让 PowerShell 把 JSON 写进临时文件，不走
+    // stdout 管道。跨宿主/父进程链时只有这种取法实测靠得住。
     let tmp = crate::win::taskbar::tmp_dir().join(format!("startapps-fetch-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let ps = PathBuf::from(crate::win::taskbar::powershell_path());
@@ -108,7 +105,7 @@ fn fetch() -> Option<Vec<(String, String)>> {
     let _ = std::fs::remove_file(&tmp);
     let text = text.trim().trim_start_matches('\u{feff}').to_string();
     let root: serde_json::Value = serde_json::from_str(&text).ok()?;
-    // Single-app results serialize as one object rather than an array.
+    // 只查到一个 app 时，序列化出来是单个对象，不是数组。
     match &root {
         serde_json::Value::Array(_) => parse_entries(&root),
         serde_json::Value::Object(_) => parse_entries(&serde_json::Value::Array(vec![root])),

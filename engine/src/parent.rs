@@ -6,9 +6,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE,
 };
 
-/// Die-with-parent watchdog: the host passes `--parent-pid <node pid>`; when
-/// that process dies the helper must terminate so no orphan keeps driving the
-/// desktop. Polls the parent handle every 500 ms.
+/// 父进程死了就退的看门狗：宿主传 `--parent-pid <node pid>`，那个进程一死
+/// 我们就得跟着结束，否则留个孤儿进程继续操作桌面。每 500 ms 查一次父进程
+/// 句柄。
 pub fn start_watchdog(parent_pid: u32) {
     thread::spawn(move || loop {
         unsafe {
@@ -17,14 +17,13 @@ pub fn start_watchdog(parent_pid: u32) {
                     let wait = windows::Win32::System::Threading::WaitForSingleObject(h, 0);
                     let _ = CloseHandle(h);
                     if wait == WAIT_OBJECT_0 {
-                        // Parent gone — exit quietly (no 130: this is not the
-                        // physical-Esc interrupt path).
+                        // 父进程没了——悄悄退（不给 130，这不是物理 Esc
+                        // 打断那条路）。
                         std::process::exit(0);
                     }
                 }
                 Ok(_) => std::process::exit(0),
-                // Parent vanished (or cannot be opened because it already
-                // exited): terminate.
+                // 父进程已经没了（或者早退了，句柄都打不开）：直接结束。
                 Err(_) => std::process::exit(0),
             }
         }

@@ -5,10 +5,10 @@ use serde_json::{json, Value};
 
 use crate::policy::{policy_from_config_read, Policy};
 
-/// The helper is a client of `codex app-server`: it spawns
-/// `<CODEX_CLI_PATH> app-server` and blocks on three calls before serving any
-/// computer-use RPC (measured live; the dsh host supplies a stub that answers
-/// these synchronously). Request ids on this leg are strings, not numbers.
+/// helper 是 `codex app-server` 的客户端：它先起一个
+/// `<CODEX_CLI_PATH> app-server`，然后卡在三次调用上，这三次没回完不接任何
+/// computer-use RPC（实测如此；dsh 宿主给的是个立刻应答的桩）。
+/// 这条连接上的请求 id 是字符串，不是数字。
 pub fn run_app_server_handshake() -> Result<Policy, String> {
     let cli = std::env::var("CODEX_CLI_PATH")
         .ok()
@@ -52,7 +52,7 @@ pub fn run_app_server_handshake() -> Result<Policy, String> {
                 continue;
             }
             let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-                continue; // skip non-JSON lines like a banner
+                continue; // 像 banner 这种非 JSON 行直接跳过
             };
             if obj.get("id").and_then(Value::as_str) == Some(id) {
                 if let Some(err) = obj.get("error") {
@@ -64,7 +64,7 @@ pub fn run_app_server_handshake() -> Result<Policy, String> {
                 }
                 return Ok(obj.get("result").cloned().unwrap_or(Value::Null));
             }
-            // notifications / other ids: ignore
+            // 通知，或者别的 id 的应答，都不管
         }
     };
 
@@ -89,7 +89,7 @@ pub fn run_app_server_handshake() -> Result<Policy, String> {
 
     let reqs = call("2", "configRequirements/read", json!({}), &mut reader, &mut stdin)?;
     if reqs.is_null() || reqs.get("requirements").is_none() {
-        // `requirements: null` is a legal answer; a whole missing field is not.
+        // `requirements: null` 是合法应答；整个字段都没有才算错。
         if reqs.get("requirements").is_none() {
             return Err("configRequirements/read did not return requirements".to_string());
         }
@@ -102,7 +102,7 @@ pub fn run_app_server_handshake() -> Result<Policy, String> {
         .ok_or_else(|| "config/read did not return config".to_string())?;
     let policy = policy_from_config_read(&config)?;
 
-    // Handshake done; the stub child is disposable from here on.
+    // 握手完事；这个桩子进程从这里起就可以扔了。
     drop(stdin);
     let _ = child.wait();
 

@@ -1,10 +1,10 @@
 use serde_json::Value;
 
-/// Policy extracted from the app-server `config/read` answer.
+/// 从 app-server 的 `config/read` 应答里抠出来的策略。
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub allow_browser_and_computer_use: bool,
-    /// "allow" | "ask" | ... (default_app_access)
+    /// "allow" | "ask" | ...（对应 default_app_access）
     pub default_app_access: String,
     pub allow_persistent_approval: bool,
     pub apps: Vec<AppRule>,
@@ -12,16 +12,16 @@ pub struct Policy {
 
 #[derive(Clone, Debug)]
 pub struct AppRule {
-    /// aumids / exes match list (whatever the policy provided)
-    #[allow(dead_code)] // kept for policy-shape compatibility (see requires_approval)
+    /// aumids / exes 的匹配列表（策略里给什么就是什么）
+    #[allow(dead_code)] // 留着是为了跟策略的字段形状对齐（见 requires_approval）
     pub matches: Vec<String>,
-    #[allow(dead_code)] // ditto
+    #[allow(dead_code)] // 同上
     pub access: String,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        // Same effective policy the dsh app-server stub answers with.
+        // 跟 dsh app-server 那个桩应答出来的生效策略一模一样。
         Policy {
             allow_browser_and_computer_use: true,
             default_app_access: "allow".into(),
@@ -32,10 +32,10 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Whether the first touch of an app must produce an approvalRequest.
-    /// `candidates` are all identity forms of the target (app id, process
-    /// path, exe name, AUMID prefix, display name).
-    #[allow(dead_code)] // stub policy answers default_app_access=allow, so today this stays false
+    /// 第一次碰某个 app 时要不要先发一条 approvalRequest。
+    /// `candidates` 是这个目标的各种身份写法（app id、进程路径、exe 名、
+    /// AUMID 前缀、显示名）。
+    #[allow(dead_code)] // 桩策略答的 default_app_access=allow，所以现在恒为 false
     pub fn requires_approval(&self, candidates: &[String]) -> bool {
         for rule in &self.apps {
             let hit = rule.matches.iter().any(|m| {

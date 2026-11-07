@@ -9,9 +9,9 @@ use crate::state::{EngineState, Response};
 use crate::win::enumerate;
 
 // ---------------------------------------------------------------------------
-// Strict parameter parsing. The original helper parses every request into
-// typed structs, so errors are byte-exact serde messages prefixed with
-// `parse {method} params: `.
+// 参数解析按原版的严格程度来：每个请求都反序列化成强类型 struct，
+// 报错就是 serde 的原文，前缀固定是 `parse {method} params: `，
+// 这样错误文案才能跟原版逐字节对上。
 // ---------------------------------------------------------------------------
 
 fn parse_params<T: DeserializeOwned>(method: &str, params: &Value) -> Result<T, String> {
@@ -49,10 +49,10 @@ struct GwsParams {
     include_screenshot: bool,
     #[serde(default = "always_true", rename = "include_text")]
     include_text: bool,
-    /// JPEG px per logical window px; 1.0 keeps the original contract.
+    /// JPEG 像素 / 逻辑窗口像素；传 1.0 就是原版约定，不缩放。
     #[serde(default)]
     scale: Option<f64>,
-    /// Crop in logical, window-relative px.
+    /// 裁剪区域，单位是逻辑像素，相对窗口左上角。
     #[serde(default)]
     region: Option<GwsRegion>,
 }
@@ -74,9 +74,8 @@ struct ClickParams {
     window: WinRef,
     x: i32,
     y: i32,
-    /// The original parses coordinates but never requires the id; the
-    /// wrapper enforces freshness on its side. When present it also selects
-    /// the snapshot's crop/scale geometry.
+    /// 原版只解析坐标，从不要求带 id；新鲜度由插件这一层把关。带了 id
+    /// 就顺便用它找这张 snapshot 的裁剪和缩放参数。
     #[serde(default, rename = "screenshotId")]
     screenshot_id: Option<String>,
     #[serde(default, rename = "mouse_button")]
@@ -145,12 +144,12 @@ struct LaunchParams {
 }
 
 // ---------------------------------------------------------------------------
-// Window resolution — the original's order and exact messages:
+// 窗口解析：顺序和报错文案都照原版抄。
 //   id == 0        -> "window id is required"
-//   pid missing    -> "foreground window did not report a process id"
-//   unaddressable  -> "window is not a usable app window"
-//   no app given   -> "window.app is required"
-//   app mismatch   -> "window id {id} no longer belongs to {app}; current owner is {owner}"
+//   pid 拿不到     -> "foreground window did not report a process id"
+//   窗口不可寻址   -> "window is not a usable app window"
+//   没给 app       -> "window.app is required"
+//   app 对不上     -> "window id {id} no longer belongs to {app}; current owner is {owner}"
 // ---------------------------------------------------------------------------
 
 struct Resolved {
@@ -159,27 +158,22 @@ struct Resolved {
     size: (i32, i32),
     owner: String,
     pid: u32,
-    /// DPI scale of this window (`GetDpiForWindow` / 96). Snapshot coordinates
-    /// are logical pixels (the screenshot the model measures on is the window
-    /// in logical px, matching the original), so they reach the screen through
-    /// this factor.
+    /// 这个窗口的 DPI 倍数（`GetDpiForWindow` / 96）。snapshot 坐标是逻辑像素
+    /// （模型量图用的截图就是逻辑像素的窗口，跟原版一致），所以要乘上这个
+    /// 倍数才能落到屏幕上。
     scale: f64,
 }
 
-/// Screen point for a coordinate measured on one specific snapshot image.
+/// 某张 snapshot 图上量到的坐标，换算成屏幕坐标。
 ///
-/// A snapshot pixel belongs to the screenshot's rectangle: the window's
-/// extended frame in logical pixels. The physical target is therefore the
-/// physical extended-frame origin plus the pixel scaled by the window DPI.
-/// Feeding the logical pixel straight into the physical origin (the old
-/// behaviour) landed every click short of the target by a factor of the scale
-/// — measured at 200%: snapshot (600,400) arrived at screen (621,821) physical
-/// instead of (1231,820).
+/// snapshot 的一个像素属于截图那个矩形：窗口的逻辑像素外框。所以物理坐标 =
+/// 物理外框原点 + 像素乘窗口 DPI。旧逻辑直接把逻辑像素加到物理原点上，
+/// 结果每次点击都差一个缩放倍数——200% 下实测：snapshot (600,400) 落到屏幕
+/// 物理坐标 (621,821)，正确位置是 (1231,820)。
 ///
-/// A downscaled (`scale`) or cropped (`region`) snapshot has more/fewer JPEG
-/// pixels than logical window pixels, so the model's `(x, y)` must first be
-/// divided by the shot scale and shifted by the crop offset. Unknown/missing
-/// ids fall back to the original window-relative mapping.
+/// 缩放过的（`scale`）或裁剪过的（`region`）截图，JPEG 像素数和逻辑窗口像素
+/// 数对不上，所以模型给的 `(x, y)` 要先除以截图缩放，再加上裁剪偏移。找不到
+/// id 或没带 id，就退回原版的窗口相对映射。
 fn to_screen_shot(
     r: &Resolved,
     st: &EngineState,
@@ -224,14 +218,14 @@ fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
     if pid == 0 {
         return Err("foreground window did not report a process id".into());
     }
-    // The original checks the app hint before resolving the owner.
+    // 原版先看 app 提示，再去解析 owner。
     let app = w
         .app
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "window.app is required".to_string())?;
-    // Owner identity: enumerate's (taskbar-corrected) form first, then the
-    // shell property store / image-path fallback.
+    // owner 的身份：先看 enumerate 那份（按任务栏修正过的），拿不到再退到
+    // shell 属性存储 / 图片路径。
     let owner = enumerate::enumerate_top_level()
         .into_iter()
         .find(|r| r.hwnd as u64 == w.id)
@@ -248,9 +242,9 @@ fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut rect);
     }
-    // Anchor on the visible frame. DWM's extended bounds exclude the invisible
-    // resize border that GetWindowRect still reports, and the screenshot covers
-    // exactly this rectangle, so it is the anchor snapshot pixels must use.
+    // 锚点用可见外框。DWM 的 extended bounds 不含那条看不见的调整边框，
+    // 而 GetWindowRect 还会把它算进去；截图正好只覆盖 DWM 这个矩形，
+    // 所以 snapshot 像素必须拿它当锚点。
     let mut ext = RECT::default();
     let origin = match unsafe {
         windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
@@ -276,16 +270,15 @@ fn resolve_win(w: &WinRef) -> Result<Resolved, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-app approval gate (spec §B.1). The original gates every app-touching
-// operation behind a first-touch approvalRequest, even when the (stub)
-// policy answers default_app_access=allow. Enumeration/diagnostic methods
-// are not gated. Canonical identity shapes (observed):
-//   process windows -> lowercase file name ("deepseek harness.exe")
-//   packaged apps   -> the AUMID verbatim
-//   browsers        -> lowercase exe file name + riskLevel "high"
+// 按 app 的审批闸（spec §B.1）。原版凡是碰 app 的操作，第一次都要先过
+// approvalRequest，哪怕（桩）策略返回的是 default_app_access=allow。
+// 枚举/诊断类方法不走这个闸。实测到的规范身份长这样：
+//   process 窗口 -> 小写文件名（"deepseek harness.exe"）
+//   打包应用     -> AUMID 原文
+//   浏览器       -> 小写 exe 文件名 + riskLevel "high"
 // ---------------------------------------------------------------------------
 
-/// Chromium-family product tokens produced by identity::app_id_for_window.
+/// identity::app_id_for_window 产出的 Chromium 系产品名。
 pub fn browser_exe(owner: &str) -> Option<&'static str> {
     match owner {
         "Chrome" => Some("chrome.exe"),
@@ -296,31 +289,27 @@ pub fn browser_exe(owner: &str) -> Option<&'static str> {
     }
 }
 
-/// True when the resolved owner is a whitelisted browser window.
+/// 解析出来的 owner 是白名单里的浏览器窗口时返回 true。
 pub fn is_browser_owner(owner: &str) -> bool {
     browser_exe(owner).is_some()
 }
 
-/// Byte-exact refusal the original emits whenever it cannot pin down the
-/// active URL of a browser window (measured: every browser touch in this
-/// environment ends up on this branch — the original has no reliable URL
-/// channel here). The turn stays stopped until end_turn.
+/// 原版只要拿不准浏览器窗口当前的 URL，就吐这段拒绝文案，一字不差：
+/// 实测这个环境里每次碰浏览器都掉进这个分支——原版在这里根本没有可靠的
+/// URL 通道。不 end_turn，这一轮就一直停着。
 pub const BROWSER_URL_POLICY_REFUSAL: &str = "Computer Use has been stopped for this turn because it could not determine the current browser URL on Windows with enough confidence to enforce policy. Stop your work and send a final message noting why Computer Use ended.";
 
-/// Escape hatch of the original gate (`func@0x7737b`, see
-/// SKY_WINDOWS_PROTOCOL_SPEC §B.4): a request meta carrying
-/// `x-codex-browser-use-security-mode: disabled-for-local-testing` sets the
-/// URL-allowed sentinel and skips the `site_status` fetch entirely. Measured
-/// live on a Chrome window — without the key an approved `get_window_state`
-/// throws the stop, with it the same call returns the full UIA tree. It is the
-/// mode OpenAI uses for its own local testing, i.e. the intended path for
-/// running the helper outside ChatGPT, which is exactly how this engine is
-/// deployed; the plugin puts it on the base meta unless the user explicitly
-/// turns it off with the `enforceBrowserUrlPolicy` config.
+/// 原版这个闸的逃生门（`func@0x7737b`，见 SKY_WINDOWS_PROTOCOL_SPEC §B.4）：
+/// 请求 meta 里带 `x-codex-browser-use-security-mode: disabled-for-local-testing`
+/// 就会把 URL-allowed 哨兵置上，整个跳过 `site_status` 拉取。在真 Chrome 窗口
+/// 上实测过：不带这个键，审批通过的 `get_window_state` 也会抛停止；带了，
+/// 同一个调用能拿回整棵 UIA 树。这是 OpenAI 自己本地测试用的模式，也就是
+/// 在 ChatGPT 外面跑这个 helper 该走的路——这个引擎正是这么部署的。所以插件
+/// 默认把它加在基础 meta 上，除非用户用 `enforceBrowserUrlPolicy` 配置显式关掉。
 pub const BROWSER_POLICY_BYPASS_KEY: &str = "x-codex-browser-use-security-mode";
 pub const BROWSER_POLICY_BYPASS_VALUE: &str = "disabled-for-local-testing";
 
-/// True when this frame opted out of remote browser URL policy enforcement.
+/// true 表示这一帧自己关掉了浏览器 URL 策略检查。
 pub fn browser_policy_bypassed(meta: &Value) -> bool {
     meta.get(BROWSER_POLICY_BYPASS_KEY)
         .and_then(Value::as_str)
@@ -350,8 +339,8 @@ fn canonical_approval_app(owner: &str) -> (String, String) {
             .to_string();
         return (file.to_lowercase(), display);
     }
-    // AUMID: the raw Get-StartApps table is the original's display-name
-    // source (catalog rows alone miss unused packages like Calculator).
+    // AUMID：显示名优先从原始的 Get-StartApps 表里取（只靠 catalog 行会漏掉
+    // 计算器这种没人用过的包）。
     let display = crate::startapps::collect()
         .into_iter()
         .find(|(_n, id)| id.eq_ignore_ascii_case(owner))
@@ -375,7 +364,7 @@ fn canonical_approval_app(owner: &str) -> (String, String) {
     (owner.to_string(), display)
 }
 
-/// Process file name used by the tree header line and lastWindowIdentity.
+/// 树头那行和 lastWindowIdentity 用的进程文件名。
 fn process_file_name(owner: &str) -> String {
     owner
         .strip_prefix("process:")
@@ -384,8 +373,7 @@ fn process_file_name(owner: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The `App:` field of the tree header line: file name for process
-/// windows, shell display name for packaged apps.
+/// 树头那行 `App:` 字段：process 窗口填文件名，打包应用填 shell 显示名。
 fn header_app_name(owner: &str) -> String {
     let file = process_file_name(owner);
     if !file.is_empty() {
@@ -394,8 +382,7 @@ fn header_app_name(owner: &str) -> String {
     canonical_approval_app(owner).1
 }
 
-/// Returns Some(approval response) when the app has not been approved in
-/// this turn yet; None when execution may proceed.
+/// 这一轮里 app 还没批过，就返回 Some(审批响应)；批过了返回 None，往下走。
 fn approval_required(st: &EngineState, owner: &str) -> Option<Response> {
     let (app_key, display_name) = canonical_approval_app(owner);
     if st.approved_apps.contains(&app_key.to_lowercase()) {
@@ -410,13 +397,11 @@ fn approval_required(st: &EngineState, owner: &str) -> Option<Response> {
     })
 }
 
-/// After approval, browser windows hit the URL policy gate. Without the
-/// local-testing opt-out the original can never pin the active URL down in
-/// this environment, so every approved browser touch lands on the byte-exact
-/// refusal (measured on live Chrome and Edge windows) and the rest of the turn
-/// stays stopped. A frame that carries the documented
-/// `x-codex-browser-use-security-mode: disabled-for-local-testing` meta takes
-/// the original's own escape hatch instead and proceeds.
+/// 批完之后，浏览器窗口还要过 URL 策略闸。没有本地测试那个豁免，原版在这个
+/// 环境里永远定不下当前 URL，所以每次审批通过的浏览器操作都撞上那段一字不差
+/// 的拒绝文案（在真 Chrome 和 Edge 窗口上实测），这一轮剩下的时间也全停住。
+/// 帧里带了文档写明的 `x-codex-browser-use-security-mode: disabled-for-local-testing`
+/// meta，就走原版自己的逃生门，能继续。
 fn browser_policy_gate(st: &mut EngineState, owner: &str, meta: &Value) -> Option<Response> {
     if !is_browser_owner(owner) {
         return None;
@@ -428,7 +413,7 @@ fn browser_policy_gate(st: &mut EngineState, owner: &str, meta: &Value) -> Optio
     Some(Response::Error(BROWSER_URL_POLICY_REFUSAL.into()))
 }
 
-/// Resolve window + gate approval in one step for all touching methods.
+/// 所有会碰窗口的方法都走这一句：解析窗口 + 过审批闸。
 fn resolve_and_approve(st: &mut EngineState, w: &WinRef, meta: &Value) -> Result<Resolved, Response> {
     let r = resolve_win(w).map_err(Response::Error)?;
     if let Some(a) = approval_required(st, &r.owner) {
@@ -437,18 +422,16 @@ fn resolve_and_approve(st: &mut EngineState, w: &WinRef, meta: &Value) -> Result
     if let Some(b) = browser_policy_gate(st, &r.owner, meta) {
         return Err(b);
     }
-    // Any touching action makes the rendered tree stale: the original always
-    // re-renders after input (a set_value followed by get_window_state must
-    // show the new value, not the cached one). The snapshot itself has to
-    // survive this call: the element_index actions resolve their element out
-    // of it immediately after this returns, and the documented contract keeps
-    // those indexes usable until the next snapshot is taken. Dropping it here
-    // made every element_index action fail with "no snapshot for window".
+    // 任何输入动作都会让渲染好的树过期：原版每次输入后一定重渲染（set_value
+    // 之后再 get_window_state，必须看到新值而不是缓存）。但 snapshot 本身得
+    // 活过这次调用：element_index 类动作这次返回后马上要从里面找元素，而且
+    // 文档约定这些索引在下次 snapshot 之前一直可用。之前在这里把 snapshot 丢了，
+    // 结果每个 element_index 动作都报 "no snapshot for window"。
     st.last_input_seq += 1;
     Ok(r)
 }
 
-/// Latest-snapshot element lookup for element_index actions.
+/// element_index 类动作用它查最近一次 snapshot 里的元素。
 fn snapshot_element(
     st: &EngineState,
     r: &Resolved,
@@ -466,12 +449,12 @@ fn snapshot_element(
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch
+// 分发
 // ---------------------------------------------------------------------------
 
-/// Serialized RPC dispatch (the channel is single-threaded by contract).
+/// RPC 分发按串行来，约定上这条通道就是单线程。
 pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value) -> Response {
-    // An approved re-send carries x-oai-cua-approved-app for this session.
+    // 审批通过后的重发请求，meta 里带着本会话的 x-oai-cua-approved-app。
     if let Some(app) = meta
         .get("x-oai-cua-approved-app")
         .and_then(Value::as_str)
@@ -481,8 +464,8 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
         st.approved_apps.insert(app);
     }
 
-    // Once the browser URL policy has stopped the turn, every touching
-    // method keeps answering with the same refusal until end_turn.
+    // 浏览器 URL 策略一旦把这一轮停了，后面每个碰窗口的方法都回同一段拒绝，
+    // 直到 end_turn。
     const TURN_SAFE: [&str; 6] = ["close", "end_turn", "diagnostic_state", "list_apps", "list_windows", "get_window"];
     if st.browser_policy_stopped && !TURN_SAFE.contains(&method) {
         return Response::Error(BROWSER_URL_POLICY_REFUSAL.into());
@@ -532,8 +515,8 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             });
             match hit {
                 Some(r) => Response::Result(json!({ "app": r.app, "id": r.hwnd, "title": r.title })),
-                // The JS client renders a null result as its own error; mirror
-                // the raw contract.
+                // 查不到就返回 null——JS 客户端会把它渲染成自己的错误，这里照
+                // 原版的原始契约来。
                 None => Response::Result(Value::Null),
             }
         }
@@ -817,9 +800,9 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 Ok(r) => r,
                 Err(resp) => return resp,
             };
-            // Observed order: approval, then the both-false include check,
-            // then the minimized refusal (an approved persistent home
-            // answers both-false with the window echo even while iconic).
+            // 实测的顺序：先审批，再看两个 include 是不是都 false，最后才是
+            // 最小化拒绝（已审批的 persistent home 就算是最小化状态，两个
+            // false 也照样回显窗口信息）。
             if let Some(a) = approval_required(st, &r.owner) {
                 return a;
             }
@@ -856,12 +839,10 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                         st.last_capture_invalidation = None;
                         use base64::Engine as _;
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.jpeg);
-                        // Field set, ids and geometry mirror the original's
-                        // screenshot records exactly: `id` "screenshot-<n>",
-                        // the window's screen origin in logical px, no
-                        // `hasContent` (the original never emits it). `scale`
-                        // is additive: it is 1.0 when the caller used the
-                        // default full-size capture.
+                        // 字段、id 和几何都跟原版的 screenshot 记录完全一致：
+                        // `id` 是 "screenshot-<n>"，原点是窗口在屏幕上的逻辑
+                        // 像素坐标，没有 `hasContent`（原版从来不发）。`scale`
+                        // 是我们加的：调用方用默认的整尺寸截图时它是 1.0。
                         result["screenshots"] = json!([{
                             "id": "screenshot-0",
                             "url": format!("data:image/jpeg;base64,{b64}"),
@@ -878,29 +859,26 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                             scale: shot.scale,
                         });
                     }
-                    // Capture failed (e.g. the Windows screen-recording
-                    // consent gate denies this exe path, a locked session, or
-                    // a protected window). The original helper fails the whole
-                    // call in that case; we keep the accessibility tree but
-                    // must not let the failure vanish — storing it only in
-                    // `last_capture_invalidation` (which `diagnostic_state`
-                    // never exposes) is what made an engine-wide capture
-                    // failure look like "this window has no screenshot".
+                    // 截图失败（比如 Windows 录屏授权把这 exe 的路径拒了、会话
+                    // 锁了，或者窗口受保护）。这种情况原版 helper 是整个调用失败；
+                    // 我们保住无障碍树，但也不能让失败悄没声地没了——只把它塞进
+                    // `last_capture_invalidation`（`diagnostic_state` 又不暴露这个
+                    // 字段），结果一次引擎级的截图失败看起来就像 "这个窗口没有截图"。
                     Err(e) => {
                         result["screenshotError"] = json!(e);
                         st.last_capture_invalidation = Some(e);
                     }
                 }
             }
-            // Coordinate mapping must work even for text-free snapshots, so
-            // the geometry lives outside the tree cache.
+            // 就算是不带文字的 snapshot 也要能换算坐标，所以几何信息放在树缓存
+            // 外面。
             if let Some(geom) = shot_geom.clone() {
                 st.shot_geoms.insert(hwnd.0 as isize, vec![geom]);
             }
 
             if p.include_text {
-                // Snapshot cache: replay the rendered tree while the window
-                // is unchanged (the original keeps the revision stable).
+                // snapshot 缓存：窗口没变就把渲染好的树直接重放（原版会保持
+                // revision 不变）。
                 let key = hwnd.0 as isize;
                 let no_cache = std::env::var("SKY_NO_CACHE").is_ok();
                 let hit = st.snapshots.get(&key).and_then(|s| {
@@ -918,9 +896,8 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                 });
                 let (tree, focused_element, document_text) = match hit {
                     Some(t) => {
-                        // The tree is replayed, but this capture may have used a
-                        // different scale/region: keep the coordinate geometry
-                        // in sync with the screenshot the model just received.
+                        // 树是从缓存重放的，但这次截图可能换了 scale/region：
+                        // 坐标几何要跟着模型刚拿到的那张截图更新。
                         if let Some(geom) = shot_geom.clone() {
                             if let Some(snap) = st.snapshots.get_mut(&key) {
                                 snap.shots = vec![geom];
@@ -979,8 +956,7 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
                                         at_seq: st.last_input_seq,
                                     },
                                 );
-                                // Original: +1 revision / +3 snapshot entries
-                                // per freshly built tree.
+                                // 原版每新构建一棵树：revision +1，snapshot 条目 +3。
                                 st.snapshot_revision += 1;
                                 st.snapshot_count += 3;
                                 st.last_window_identity = Some(json!({
@@ -1034,7 +1010,22 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             };
             let plan = match crate::launch::plan(&p.app) {
                 Ok(plan) => plan,
-                Err(e) => return Response::Error(e),
+                Err(e) => {
+                    // 原版对裸名字直接报错；这里先把 "画图"/"Paint" 这类名字
+                    // 折成 AppsFolder 清单里的 AUMID，折不出来再报原错误。
+                    let resolved = if crate::launch::is_bare_name(&p.app) {
+                        crate::launch::resolve_name(&p.app)
+                    } else {
+                        None
+                    };
+                    match resolved {
+                        Some(aumid) => match crate::launch::plan(&aumid) {
+                            Ok(plan) => plan,
+                            Err(_) => return Response::Error(e),
+                        },
+                        None => return Response::Error(e),
+                    }
+                }
             };
             let owner = crate::launch::plan_owner(&plan);
             if let Some(a) = approval_required(st, &owner) {
@@ -1052,7 +1043,8 @@ pub fn dispatch(st: &mut EngineState, method: &str, params: &Value, meta: &Value
             }
         }
         "start_audio_recording" | "stop_audio_recording" => {
-            // Double-gated by SKY_ENABLE_AUDIO="1" in the real helper.
+            // 原版要 SKY_ENABLE_AUDIO="1" 才开录音。这里也先查这个开关；
+            // 录音本身没实现，开了也只会回 not implemented。
             if std::env::var("SKY_ENABLE_AUDIO").ok().as_deref() != Some("1") {
                 return Response::Error("computer audio recording is not enabled".into());
             }

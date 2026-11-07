@@ -1,11 +1,10 @@
-// Taskbar AppUserModelIDs via UI Automation.
+// 通过 UI Automation 读任务栏的 AppUserModelID。
 //
-// The helper reports taskbar-pinned identities (e.g. Electron apps that call
-// app.setAppUserModelId) as the running-app id. That identity is only
-// readable from the Explorer taskbar button: its UIA element carries
-// AutomationId "Appid: <AUMID>". Query Explorer through a PowerShell
-// UIAutomation probe (same subprocess pattern as the Start-menu catalog) and
-// cache the result; a stale cache is used when the probe fails.
+// 原版 helper 把任务栏上钉住的那些身份（比如调了 app.setAppUserModelId 的
+// Electron 应用）当成 running-app id 报出来。这个身份只能从 Explorer 的
+// 任务栏按钮上读：它的 UIA 元素带 AutomationId "Appid: <AUMID>"。所以用
+// PowerShell 的 UIAutomation 探针去问 Explorer（起子进程的套路跟开始菜单
+// 清单一样），结果缓存起来；探针失败就拿旧缓存顶着。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,7 +32,7 @@ if($tb){
 
 const TTL: Duration = Duration::from_secs(5 * 60);
 
-/// title-lower -> AUMID
+/// 标题小写 -> AUMID
 pub fn appids() -> HashMap<String, String> {
     cache().read()
 }
@@ -70,7 +69,7 @@ impl Cache {
                 return map.clone();
             }
         }
-        // Refresh once; other callers wait briefly for the result.
+        // 只刷一次；别的调用者等一小会儿，直接拿刷好的结果。
         let started = {
             let mut busy = self.inflight.lock().unwrap();
             if *busy {
@@ -94,14 +93,14 @@ impl Cache {
                 return map;
             }
         }
-        // Failure: keep serving the stale snapshot.
+        // 失败了：继续用旧的那份。
         self.inner.lock().unwrap().clone()
     }
 }
 
 pub fn powershell_path() -> String {
-    // The engine may run with a stripped environment (no WINDIR/PATH), so
-    // fall back to the well-known location.
+    // 引擎可能在环境变量被清空的情况下跑（连 WINDIR/PATH 都没有），
+    // 拿不到就退到那个固定路径。
     for var in ["WINDIR", "SystemRoot", "windir"] {
         if let Ok(w) = std::env::var(var) {
             if !w.trim().is_empty() {
@@ -112,10 +111,10 @@ pub fn powershell_path() -> String {
     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".to_string()
 }
 
-/// Scratch directory; tests point SKY_TMP_DIR at a writable path when the
-/// default temp dir is not writable in their sandbox. The engine may run
-/// with a stripped environment (no TMP/TEMP/LOCALAPPDATA), so the last
-/// resort is the executable's own directory (always writable for us).
+/// 临时文件目录。测试里沙箱不让写默认临时目录，就把 SKY_TMP_DIR 指到一个
+/// 能写的路径。引擎也可能在环境变量被清空的情况下跑（TMP/TEMP/
+/// LOCALAPPDATA 都没有），最后实在不行就落在 exe 自己那个目录（对我们
+/// 总是可写）。
 pub(crate) fn tmp_dir() -> PathBuf {
     for var in ["SKY_TMP_DIR", "TMP", "TEMP", "TMPDIR"] {
         if let Ok(d) = std::env::var(var) {
@@ -159,9 +158,9 @@ fn dbg_log(msg: &str) {
 
 fn probe() -> Option<HashMap<String, String>> {
     let ps = powershell_path();
-    // Write the JSON to a temp file instead of piping stdout: a piped
-    // console child breaks UIAutomation's cross-process channel from this
-    // process type (verified: pipe → empty, file → complete).
+    // 让 PowerShell 把 JSON 写进临时文件，不走 stdout 管道：这种进程起一个
+    // 带管道的控制台子进程，会把 UIAutomation 的跨进程通道弄坏
+    // （实测：走管道拿回来是空的，走文件是完整的）。
     let tmp = tmp_dir().join(format!("dsh-sky-taskbar-{}.json", std::process::id()));
     let cmd = format!(
         "{SCRIPT}\n\"{0}\" | Set-Content -LiteralPath '{1}' -Encoding UTF8",
@@ -169,7 +168,7 @@ fn probe() -> Option<HashMap<String, String>> {
         tmp.display()
     );
     let script_path = tmp_dir().join(format!("dsh-sky-taskbar-{}.ps1", std::process::id()));
-    // PS 5.1 needs a BOM to read UTF-8 scripts correctly.
+    // PS 5.1 要有 BOM 才能正确读 UTF-8 脚本。
     let mut script_bytes = vec![0xEFu8, 0xBB, 0xBF];
     script_bytes.extend_from_slice(cmd.as_bytes());
     if let Err(e) = std::fs::write(&script_path, &script_bytes) {
@@ -265,14 +264,14 @@ fn probe() -> Option<HashMap<String, String>> {
     Some(map)
 }
 
-/// "DeepSeek Harness - 1 个运行窗口" → "DeepSeek Harness"
+/// "DeepSeek Harness - 1 个运行窗口" → "DeepSeek Harness"（砍掉窗口计数）
 fn button_title(name: &str) -> Option<&str> {
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    // The count suffix is localized; the stable separator is " - N " where N
-    // is a number, optionally followed by anything.
+    // 计数后缀是本地化的，靠得住的分隔只有 " - N "：N 是数字，后面跟什么
+    // 都行。
     if let Some(idx) = name.rfind(" - ") {
         let tail = &name[idx + 3..];
         let digits_len = tail.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -290,7 +289,7 @@ fn button_title(name: &str) -> Option<&str> {
 }
 
 fn starts_with_cjk_count(s: &str) -> bool {
-    // Localized forms put the unit right after the number ("3 个运行窗口").
+    // 本地化的写法把量词紧贴在数字后面（"3 个运行窗口"）。
     s.starts_with(char::is_whitespace)
         || s.starts_with('个')
         || s.starts_with('個')

@@ -1,4 +1,4 @@
-# Mounts the exclusive computer-use registry and the standalone Sky provider.
+# 挂上独占的 computer-use 注册位，以及独立的 Sky provider。
 - insert:
     - id: computer-use-registry
       name: '@deepseek-ai/dsh-computer-use'

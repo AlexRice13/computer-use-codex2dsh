@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use crate::methods;
 use crate::state::{EngineState, Response};
 
-/// Known RPC methods (exe blob at @0x1253170, byte-exact):
-/// anything else answers `unsupported method: <name>`.
+/// 认得的 RPC 方法（原版 exe 里在 @0x1253170，逐字节对过）：
+/// 不在表里的回 `unsupported method: <name>`。
 const KNOWN_METHODS: &[&str] = &[
     "start_audio_recording",
     "stop_audio_recording",
@@ -46,8 +46,8 @@ fn turn_key_from(meta: &Value) -> Option<String> {
 }
 
 pub fn serve(policy: crate::policy::Policy) {
-    // The dispatch thread serves all handlers inline (COM identity, capture,
-    // input); initialize COM once for its whole lifetime.
+    // 分发线程上所有 handler 都是内联跑的（COM 身份、截图、输入），
+    // 所以这里一次初始化 COM，管到进程结束。
     let _com = crate::win::com::ComGuard::new();
     let state = Arc::new(Mutex::new(EngineState::new(policy)));
     let stdin = std::io::stdin();
@@ -57,7 +57,7 @@ pub fn serve(policy: crate::policy::Policy) {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break, // stdin closed
+            Ok(0) | Err(_) => break, // stdin 关了
             Ok(_) => {}
         }
         let trimmed = line.trim();
@@ -65,9 +65,9 @@ pub fn serve(policy: crate::policy::Policy) {
             continue;
         }
         let Ok(frame) = serde_json::from_str::<Value>(trimmed) else {
-            continue; // unreadable input frame: ignore (client never sends these)
+            continue; // 解析不了的帧就跳过（客户端不会发这种）
         };
-        // Only numeric ids get responses (spec §A.4); notifications ignored.
+        // 只有数字 id 才回包（规范 §A.4）；通知一律不理。
         let Some(id) = frame.get("id").and_then(Value::as_i64) else {
             continue;
         };
@@ -83,9 +83,9 @@ pub fn serve(policy: crate::policy::Policy) {
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
 
-        // Turn transitions: a new turn key clears session approvals lazily;
-        // end_turn is answered below (the client drives previous-turn end_turn
-        // itself, per spec §E.3).
+        // 换 turn：见到新的 turn key 就把会话里的批准清掉，顺手清、不提前清；
+        // end_turn 在下面正常回包（上一轮的 end_turn 是客户端自己发的，
+        // 见规范 §E.3）。
         if let Some(key) = turn_key_from(&meta) {
             let mut st = state.lock().unwrap();
             if st.last_turn_key.as_deref() != Some(key.as_str()) {
@@ -105,11 +105,10 @@ pub fn serve(policy: crate::policy::Policy) {
             continue;
         }
 
-        // Per-request budget (x-oai-cua-request-budget-ms). Handlers bound
-        // their own work (UIA tree walk, capture polling) below the budget,
-        // so we run serially on this thread and answer the budget error when
-        // elapsed time exceeded it — identical wire text to the threaded
-        // original, just delivered after the handler's internal cap.
+        // 每个请求的时间预算（x-oai-cua-request-budget-ms）。handler 自己会
+        // 在预算内收手（UIA 树遍历、截图轮询都有上限），所以这里就串行跑，
+        // 超了才回预算错误——错误文案跟原版多线程版一模一样，只是要等
+        // handler 自己的上限到了才发得出去。
         let started = std::time::Instant::now();
         let resp = {
             let mut st = state.lock().unwrap();

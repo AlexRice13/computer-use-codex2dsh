@@ -1,10 +1,9 @@
-// UserAssist usage history (HKCU), the source of the helper's curated
-// list_apps entries (lastUsedDate / useCount + the entry set itself).
+// UserAssist 里记着用户跑过哪些程序（HKCU），原版 helper 那份挑过的
+// list_apps 条目就是从这儿来的（lastUsedDate / useCount，连条目集合本身也是）。
 //
-// Value names are ROT13 encoded paths; the 72-byte payloads on this OS
-// (Win11 24H2, header marker 0x68) carry the run count as u32 @ 0x04 and the
-// last-run FILETIME as u64 @ 0x40 — calibrated against the real helper's
-// useCount/lastUsedDate for six known apps.
+// 值名是 ROT13 编码过的路径。这台系统（Win11 24H2，头部标记 0x68）上 72 字节
+// 的数据里，0x04 处的 u32 是运行次数，0x40 处的 u64 是最后运行的 FILETIME。
+// 拿六个已知应用跟原版 helper 的 useCount/lastUsedDate 对过，位置就是这么定的。
 
 use std::collections::HashMap;
 
@@ -18,8 +17,8 @@ use windows::Win32::System::Time::FileTimeToSystemTime;
 
 #[derive(Clone, Debug)]
 pub struct AssistInfo {
-    /// ROT13-decoded value name: an exe path, a `{GUID}\…` known-folder
-    /// path, a `.lnk` path, or a bare AUMID.
+    /// ROT13 解出来的值名：一个 exe 路径、`{GUID}\…` 形式的已知文件夹路径、
+    /// 一个 `.lnk` 路径，或者裸 AUMID。
     pub decoded: String,
     pub use_count: u32,
     pub last_used_date: Option<String>,
@@ -108,7 +107,7 @@ unsafe fn subkey_names(h: HKEY) -> Vec<String> {
     out
 }
 
-/// Collect all UserAssist app-run entries across every GUID subkey.
+/// 把所有 GUID 子键下的 UserAssist 应用启动记录都收进来。
 pub fn collect() -> HashMap<String, AssistInfo> {
     let trace = std::env::var("SKY_TRACE").is_ok();
     let mut map: HashMap<String, AssistInfo> = HashMap::new();
@@ -129,8 +128,8 @@ pub fn collect() -> HashMap<String, AssistInfo> {
         if trace {
             eprintln!("[trace] UA guids={}", guids.len());
         }
-        // The helper only consumes the app-launch GUID; RunMRU and friends
-        // add noise (TaskBar/ImplicitAppShortcuts lnks, one-off exes).
+        // 原版只认应用启动这一个 GUID；RunMRU 之类的只会加噪音（TaskBar /
+        // ImplicitAppShortcuts 的 lnk、只跑过一次的 exe）。
         const APP_LAUNCH_GUID: &str =
             "{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}";
         let guids: Vec<String> = guids
@@ -161,7 +160,7 @@ pub fn collect() -> HashMap<String, AssistInfo> {
                     Some(&mut dlen),
                 );
                 if rc.0 == 122 {
-                    // Retry with the exact size.
+                    // 122 是缓冲区不够，按它给的真实大小再读一次。
                     data = vec![0u8; dlen as usize];
                     nlen = nbuf.len() as u32;
                     let mut dlen2 = dlen;
@@ -215,8 +214,8 @@ pub fn collect() -> HashMap<String, AssistInfo> {
                 }
                 let key = decoded.to_lowercase();
                 let use_count = le_u32(&data, 4);
-                // The payload stores the FILETIME high part as u32 at 0x40
-                // (429 s precision — ample for a date), UTC.
+                // 数据里 0x40 处只放 FILETIME 的高 32 位（精度 429 秒，取个日期
+                // 足够了），UTC。
                 let last_used_date = filetime_to_utc_date(le_u32(&data, 0x40) as u64 * 4_294_967_296);
                 let entry = map.entry(key).or_insert_with(|| AssistInfo {
                     decoded: decoded.clone(),
@@ -247,8 +246,8 @@ pub fn collect() -> HashMap<String, AssistInfo> {
             }
         }
     }
-    // Measured ground truth: the original emits useCount: 0 even when the
-    // record has no last-used date (CPU-Z, clash-verge, Docker Desktop all
-    // render as "0|-"), so never-drop userassist records stay as-is.
+    // 实测出来的底线：记录没有 last-used 日期时，原版照样输出 useCount: 0
+    // （CPU-Z、clash-verge、Docker Desktop 都显示成 "0|-"），所以 userassist
+    // 的记录一条都不丢，原样留着。
     map
 }

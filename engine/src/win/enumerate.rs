@@ -7,13 +7,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::com::ComGuard;
 use super::identity;
 
-/// A resolved top-level window, shaped after what the helper reports.
+/// 解析好的一个顶层窗口，字段形状照着原版 helper 报的来。
 #[derive(Clone)]
 pub struct WindowRecord {
     pub app: String,
     pub hwnd: isize,
     pub title: String,
-    #[allow(dead_code)] // kept for diagnostics / future per-pid queries
+    #[allow(dead_code)] // 留着做诊断，以后也可能按 pid 查
     pub pid: u32,
     #[allow(dead_code)]
     pub bounds: Option<RECT>,
@@ -33,14 +33,14 @@ const DESKTOP_CLASSES: &[&str] = &["Progman", "WorkerW", "Shell_TrayWnd"];
 const UWP_CONTENT_CLASSES: &[&str] = &["Windows.UI.Core.CoreWindow", "Windows.UI.Core.AppWindow"];
 const FRAME_HOST_EXE: &str = "applicationframehost.exe";
 
-/// Enumerate visible, non-cloaked top-level windows with a resolvable
-/// identity (spec §C.1: skip pid 0, cloaked, invisible, unresolvable).
+/// 列出可见、没被 cloaked、身份又解析得出来的顶层窗口
+/// （规范 §C.1：pid 0、cloaked、不可见、解析不出的全跳过）。
 pub fn enumerate_top_level() -> Vec<WindowRecord> {
-    // The shell property store (AUMID lookup) requires COM on this thread.
+    // 查 AUMID 要用 shell 的属性存储，这个线程上得先有 COM。
     let _com = ComGuard::new();
 
-    // Pass 1: raw collection (no filters) so identity resolution can see the
-    // UWP content windows (which may be cloaked or otherwise unfilters).
+    // 第一遍：原样全收，什么条件都不加。这样解析身份时还看得见 UWP 的内容
+    // 窗口——它们可能被 cloaked，也可能因为别的条件被筛掉。
     unsafe extern "system" fn cb(hwnd: windows::Win32::Foundation::HWND, lparam: LPARAM) -> windows::core::BOOL {
         let out = &mut *(lparam.0 as *mut Vec<RawWin>);
         let mut pid = 0u32;
@@ -64,7 +64,7 @@ pub fn enumerate_top_level() -> Vec<WindowRecord> {
         let _ = EnumWindows(Some(cb), LPARAM(&mut raw as *mut _ as isize));
     }
 
-    // Pass 2: filter + resolve identity.
+    // 第二遍：先过滤，再解析身份。
     let mut out = Vec::new();
     for w in &raw {
         if w.pid == 0 || !w.visible || w.cloaked || w.toolwindow {
@@ -73,15 +73,15 @@ pub fn enumerate_top_level() -> Vec<WindowRecord> {
         if DESKTOP_CLASSES.contains(&w.class.as_str()) {
             continue;
         }
-        // UWP content windows are surfaced through their frame, not listed
-        // standalone (the real helper never lists them separately).
+        // UWP 的内容窗口是挂在它的 frame 上露出来的，不单独列一条
+        // （原版 helper 从来不会把它们单列）。
         if UWP_CONTENT_CLASSES.contains(&w.class.as_str()) {
             continue;
         }
         let mut app = identity::app_id_for_window(w.hwnd, w.pid);
         if app.is_none() {
-            // ApplicationFrameHost frame: the AUMID belongs to the packaged
-            // app process behind the owned Windows.UI.Core content window.
+            // ApplicationFrameHost 的框：AUMID 属于框后面那个
+            // Windows.UI.Core 内容窗口所在的打包应用进程。
             let is_frame_host = identity::process_image_path(w.pid)
                 .map(|p| {
                     p.rsplit('\\')
@@ -127,8 +127,8 @@ pub fn enumerate_top_level() -> Vec<WindowRecord> {
     out
 }
 
-/// Debug-only (--wins): every raw EnumWindows entry with its filter fields
-/// and identity resolution, for diagnosing enumeration divergences.
+/// 只在调试时用（--wins）：EnumWindows 拿到的每一条都原样打出来，带上过滤
+/// 用的字段和身份解析结果，专门查枚举结果对不上的问题。
 pub fn debug_windows() -> Vec<(isize, u32, String, String, bool, bool, bool, Option<String>)> {
     let _com = ComGuard::new();
     unsafe extern "system" fn cb(hwnd: windows::Win32::Foundation::HWND, lparam: LPARAM) -> windows::core::BOOL {

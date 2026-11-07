@@ -1,83 +1,74 @@
-// UI Automation tree construction for get_window_state. The original helper
-// renders the control-view tree as an indented text document:
+// get_window_state 的 UIA 树就在这儿拼。原版把 control view 的树渲染成一份
+// 带缩进的文本：
 //
 //   Window: "{title}", App: {exe}.
 //   \t{idx} {LocalizedControlType} [(disabled)] [(settable, string)] [{name}]
 //       [ Description: …] [ Value: …] [ ID: …] [ Secondary Actions: Raise]
 //
-// with a global element index feeding element_index actions, the focused
-// node echoed as its own tree line, and document_text from the last
-// Document node's ValuePattern.
+// 索引是全局的，element_index 操作靠它找元素。焦点节点单独占一行回显。
+// document_text 取自最后一个 Document 节点的 ValuePattern。
 
 use uiautomation::core::{UIAutomation, UIElement};
 use uiautomation::patterns::{UILegacyIAccessiblePattern, UIValuePattern};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
-/// One row of the flattened snapshot tree, kept for element_index actions.
+/// 拍平后的树里的一行，留着给 element_index 操作用。
 pub struct ElementRecord {
     pub element: UIElement,
-    #[allow(dead_code)] // descriptive fields kept for diagnostics/future filters
+    #[allow(dead_code)] // 这几个描述字段留着查问题，以后也可能拿来做过滤
     pub name: String,
-    #[allow(dead_code)] // ditto
+    #[allow(dead_code)] // 同上
     pub control_type: String,
-    /// Screen-space rectangle (left, top, width, height).
+    /// 屏幕坐标的矩形（left, top, width, height）。
     pub rect: (i32, i32, i32, i32),
-    #[allow(dead_code)] // ditto
+    #[allow(dead_code)] // 同上
     pub offscreen: bool,
-    #[allow(dead_code)] // ditto
+    #[allow(dead_code)] // 同上
     pub enabled: bool,
 }
 
 pub struct BuiltTree {
-    /// Rendered tree (header line + one tab-indented line per node).
+    /// 渲染好的树：header 一行，之后每个节点一行，按层级加 tab。
     pub tree: String,
-    /// Elements in index order (index == position in this vec == tree idx).
+    /// 按下标排的元素。下标 == 在这个 vec 里的位置 == 树里的 idx。
     pub elements: Vec<ElementRecord>,
-    /// Focused element rendered as its tree line (index matches the tree).
+    /// 焦点元素在树里的那一行（下标跟树对得上）。
     pub focused_element: Option<String>,
-    /// Text of the last Document node's value (browser page text).
+    /// 最后一个 Document 节点的文本，也就是网页正文。
     pub document_text: Option<String>,
 }
 
-/// Cap on walked elements. 600 used to cut real pages off: the commit list of
-/// a busy repository measured 868 nodes through the reference client, and the
-/// walk stopped at exactly index 599. 2000 is above the largest tree observed
-/// anywhere, so the limit no longer decides what the model gets to see;
-/// TREE_BUDGET_MS remains the guard against pathological pages.
+/// 走树时的节点数上限。以前是 600，真实页面会被砍断：一个忙仓库的 commit 列表
+/// 用原版客户端实测 868 个节点，我们正好停在 index 599 就没了。现在放到 2000，
+/// 比目前见过的任何一棵树都大，所以这条限制不再决定模型能看到多少；防病态页面
+/// 的仍是 TREE_BUDGET_MS。
 const MAX_ELEMENTS: usize = 2000;
 const MAX_DEPTH: usize = 64;
 const TREE_BUDGET_MS: u128 = 6500;
 
-/// Elements at or below this count mean the provider has not answered yet:
-/// measured stub trees are 2-4 nodes (Paint 2, Chrome 3) against real trees of
-/// 181 and 1438. Anything above this is a window that walked fine and must
-/// never enter the wake path.
+/// 节点数小于等于这个值，说明 provider 还没应答。实测桩树就是 2-4 个节点
+/// （Paint 2 个、Chrome 3 个），而真树是 181 和 1438。超过这个数的窗口就是
+/// 走通了，绝不能放它进 wake 路径。
 const STUB_MAX: usize = 12;
 
-// `SECURITY_MANDATORY_LOW_RID` / `..._MEDIUM_RID` from Win32_System_SystemServices,
-// inlined so this diagnostic costs no extra `windows` crate feature.
+// `SECURITY_MANDATORY_LOW_RID` / `..._MEDIUM_RID` 本来在 Win32_System_SystemServices
+// 里，这里直接把值抄过来，省得为一个诊断多开一个 `windows` crate feature。
 const MANDATORY_LOW_RID: u32 = 0x1000;
 const MANDATORY_MEDIUM_RID: u32 = 0x2000;
 
-/// Mandatory integrity level of this process, as the last SID sub-authority of
-/// its `TokenIntegrityLevel` label: 0x1000 Low, 0x2000 Medium, 0x3000 High,
-/// 0x4000 System. `-1` means "not queried yet", `-2` means "could not be
-/// queried" (in which case we behave as if the level were fine and let the
-/// wake path run its normal bounded course).
+/// 本进程的完整性级别，取 `TokenIntegrityLevel` 标签 SID 最后一个子权威值：
+/// 0x1000 Low、0x2000 Medium、0x3000 High、0x4000 System。`-1` 表示还没查过，
+/// `-2` 表示查不到（这时就当级别没问题，让 wake 路径按原来的限时流程走一遍）。
 ///
-/// WHY THIS IS HERE. A client process below Medium mandatory level can never
-/// be handed a real UIA tree: the UIA core will not open an out-of-process
-/// provider connection across the Medium boundary, so every window answers
-/// with the frame the core can synthesize in-proc — the window plus its title
-/// bar, i.e. exactly the 2-4 node "stub" this file has been chasing for three
-/// agents. It is a property of the *token*, not of the request, so no advise,
-/// event handler, apartment, message pump, settle loop or hosted-CLR walk can
-/// change it; measured all of those, all inert, and the same `sky-engine.exe`
-/// bytes walk Paint to 230 nodes when launched from a directory without a Low
-/// mandatory label and to 2 from one with it. Detecting it here turns a
-/// 2-4 node mystery into one trace line, and stops us paying for a wake that
-/// provably cannot land.
+/// 为什么要查：低于 Medium 的客户端进程永远拿不到真正的 UIA 树。UIA 核心不会
+/// 跨 Medium 这条边界去开进程外 provider 连接，每个窗口只能用核心在进程内拼出来
+/// 的框架应付——窗口加标题栏，正好就是 2-4 个节点，也就是这个文件折腾了几轮
+/// 才弄明白的那个“桩”。这是 token 的性质，不是请求的问题：advise、事件处理、
+/// apartment、消息泵、settle 循环、托管 CLR 全试过，全没用。同一个
+/// `sky-engine.exe`，从不带 Low 标签的目录启动，画图能走到 230 个节点；从带 Low
+/// 标签的目录启动只有 2 个。在这里认出来，2-4 个节点的怪事就变成一行 trace，
+/// 也省得为一个明知不会成的 wake 白费功夫。
 static INTEGRITY_RID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 fn integrity_rid() -> i64 {
@@ -100,8 +91,8 @@ fn query_integrity_rid() -> Option<u32> {
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         let mut token = windows::Win32::Foundation::HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
-        // TOKEN_MANDATORY_LABEL is { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } },
-        // so the label SID pointer is the first machine word of the buffer.
+        // TOKEN_MANDATORY_LABEL 是 { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } }，
+        // 所以缓冲区开头第一个机器字就是标签的 SID 指针。
         let mut buf = [0u8; 64];
         let mut len = 0u32;
         let r = GetTokenInformation(
@@ -125,17 +116,16 @@ fn query_integrity_rid() -> Option<u32> {
     }
 }
 
-/// Below Medium mandatory level the stub is structural, not temporal: waiting,
-/// advising or hosting a CLR cannot make the UIA core cross the boundary.
+/// 低于 Medium 时桩是结构性的，不是等一会儿就会好：等待、advise、托管 CLR
+/// 都没法让 UIA 核心跨过这条边界。
 fn below_medium_il() -> bool {
     matches!(integrity_rid(), r if (0..(MANDATORY_MEDIUM_RID as i64)).contains(&r))
 }
 
-/// Once per process, say it out loud too. With the wake path gated off, a
-/// Low-IL engine would otherwise answer *every* window with a 2-4 node stub and
-/// the only clue would be an opt-in trace file; stderr is the one channel the
-/// engine has that the operator actually sees, and it is not the JSON-RPC
-/// stdout channel, so the output contract is untouched.
+/// 每个进程也往 stderr 喊一次。wake 路径默认关着，不然一个 Low IL 的引擎会对
+/// *每个* 窗口都回 2-4 个节点的桩，唯一线索只有一份要手动打开的 trace 文件。
+/// stderr 是引擎手里运维真能看到的那条通道，而且不是 JSON-RPC 的 stdout，
+/// 所以输出约定不受影响。
 fn warn_low_il_once() {
     use std::sync::atomic::AtomicBool;
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -154,7 +144,7 @@ fn warn_low_il_once() {
     }
 }
 
-/// Human name for the token's mandatory level, for the trace line.
+/// 完整性级别的人话名字，trace 里用。
 fn integrity_name(rid: i64) -> &'static str {
     match rid as u32 {
         MANDATORY_LOW_RID => "Low",
@@ -165,32 +155,27 @@ fn integrity_name(rid: i64) -> &'static str {
     }
 }
 
-/// The wake path is behind an opt-in gate (`SKY_WAKE=1`) and off by default.
+/// wake 路径要显式开关（`SKY_WAKE=1`），默认关。
 ///
-/// It has never been measured to land a tree on this machine (0/5), and the
-/// reason is now known: every one of those measurements — plus the "the managed
-/// stack only gets 4 nodes too" conclusion that retired the CLR-hosting work —
-/// was taken from a client process running below Medium mandatory level, where
-/// no client-side trick can ever work. Meanwhile the cost is real: on a stubbed
-/// window it put a thread, a cross-process advise and up to `WAKE_WINDOW_MS` of
-/// waiting in front of the first request (measured q1 1194 ms with the wake
-/// path live versus ~80 ms with it gated), which is the latency regression that
-/// was previously blamed on `methods.rs`. A window that walks normally still
-/// pays nothing either way, because the stub test gates entry.
+/// 在这台机器上从来没测到它真能拿到树（0/5）。原因现在知道了：那 5 次测量，
+/// 加上“托管栈也只有 4 个节点”这个让 CLR 托管那摊活收工的结论，全是在低于
+/// Medium 的客户端进程里做的，那种环境下客户端怎么折腾都没用。代价倒是实打实：
+/// 碰到桩窗口时，它会在第一个请求前头塞一个线程、一次跨进程 advise、最多
+/// `WAKE_WINDOW_MS` 的等待（实测 q1 开着 wake 是 1194 ms，关掉约 80 ms），之前
+/// 这段延迟被记到了 `methods.rs` 头上。走得通的窗口两头都不花时间，因为入口被
+/// 桩判断挡住了。
 fn wake_enabled() -> bool {
     std::env::var("SKY_WAKE").map(|v| v == "1").unwrap_or(false)
 }
 
-/// Hard ceiling on the wake attempt. The reference helper's cold first request
-/// takes ~400-660 ms, so this covers a legitimate late provider activation
-/// without letting an unwakeable provider eat the request. TREE_BUDGET_MS
-/// remains the absolute guard on the whole build.
+/// wake 尝试的硬上限。原版客户端冷启动第一个请求要 400-660 ms 左右，这个值够
+/// 覆盖 provider 正常晚到，又不至于让一个根本唤不醒的 provider 把请求吃掉。
+/// 整个建树过程的绝对兜底还是 TREE_BUDGET_MS。
 const WAKE_WINDOW_MS: u64 = 1200;
 const RETRY_INTERVAL_MS: u64 = 90;
 
-/// The wake path is single-flight for the life of the process. It has never
-/// been observed to help on this machine, so paying it once is already
-/// generous; paying it per window would be pure latency.
+/// wake 路径整个进程只跑一次。在这台机器上没见过它有用，付一次已经算大方；
+/// 每个窗口都付就是纯白等。
 static WAKE_ATTEMPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -220,14 +205,13 @@ fn one_line(s: &str) -> String {
         .to_string()
 }
 
-// Wake a potentially suspended UIA provider: the original helper is proven
-// (ETW: IRawElementProviderAdviseEvents::AdviseEventAdded(20005) x360 during
-// its first request) to hold live focus-changed + structure-changed event
-// advices, which make the UIA core negotiate event-enabled connections with
-// every provider it connects to. We subscribe the same pair (process-wide
-// AutomationFocusChanged 20005 + subtree StructureChanged) and then let the
-// tree walk run against a growth-stable retry loop so the Chromium provider
-// has its settle window inside the same request budget.
+// 目的是唤醒可能挂起的 UIA provider。原版第一个请求期间用 ETW 抓过
+// （IRawElementProviderAdviseEvents::AdviseEventAdded(20005) 出现 360 次），
+// 证明它一直挂着 focus-changed 和 structure-changed 两种事件 advise。UIA 核心
+// 因此会跟每个连上的 provider 协商“开事件”的连接。我们照抄这一对（进程级
+// AutomationFocusChanged 20005 + 子树 StructureChanged），然后让走树跑在一个
+// “长到不再变”的重试循环里，这样 Chromium provider 在同一个请求预算内就有自己
+// 的 settle 窗口。
 #[allow(non_camel_case_types)]
 mod uia_bindings {
     use windows::core::{implement, Ref as WinRef, Result as WinResult};
@@ -268,30 +252,25 @@ mod uia_bindings {
 
     pub use windows::Win32::UI::Accessibility::IUIAutomationStructureChangedEventHandler as HandlerIfc;
 
-    /// The UIA core keeps calling into the handler from its own threads;
-    /// we only ever park strong references, which is Send-safe across the
-    /// MTA process.
+    /// UIA 核心会从它自己的线程回调 handler。我们只是把强引用存着不放，
+    /// 跨 MTA 进程算 Send 安全。
     pub struct Keepalive(#[allow(dead_code)] pub HandlerIfc);
-    // SAFETY: interface pointer to an apartment-agnostic COM object.
+    // SAFETY: 这是个跟 apartment 无关的 COM 对象的接口指针。
     unsafe impl Send for Keepalive {}
 
     pub struct FocusKeepalive(#[allow(dead_code)] pub IUIAutomationFocusChangedEventHandler);
-    // SAFETY: interface pointer to an apartment-agnostic COM object.
+    // SAFETY: 这是个跟 apartment 无关的 COM 对象的接口指针。
     unsafe impl Send for FocusKeepalive {}
 }
 
-/// Run the process's single wake attempt for a stubbed window.
+/// 对一个桩窗口跑本进程唯一的一次 wake 尝试。
 ///
-/// Safety properties, in priority order:
-///   1. Never hang the engine. The body runs on a dedicated thread and the
-///      caller only ever waits on `recv_timeout`. On timeout we drop the
-///      receiver, return the tree we already have, and let the abandoned
-///      thread die on its own — a hung engine is a far worse outcome than a
-///      stub tree, so this timeout is the load-bearing guarantee.
-///   2. Never crash the engine. Every fallible step returns `false`; nothing
-///      in the wake path can surface an error to the caller.
-///   3. At most once per process, and reachable only from the stub branch, so
-///      a window that walked normally pays nothing.
+/// 按重要性排的三条底线：
+///   1. 不能把引擎卡死。主体在单独线程里跑，调用方只等 `recv_timeout`。超时就
+///      丢掉接收端，返回已经拿到的树，让那个被扔下的线程自己慢慢死。引擎卡死
+///      比拿到桩树糟得多，所以这个超时是底线。
+///   2. 不能把引擎搞崩。每一步失败都返回 `false`，wake 路径里的错不会冒到调用方。
+///   3. 一个进程最多一次，而且只有走桩那条分支能进来，正常走通的窗口不用陪跑。
 fn run_wake_attempt(hwnd: HWND, started: u64) -> bool {
     if WAKE_ATTEMPTED
         .compare_exchange(
@@ -302,7 +281,7 @@ fn run_wake_attempt(hwnd: HWND, started: u64) -> bool {
         )
         .is_err()
     {
-        return false; // this process already spent its one attempt
+        return false; // 这个进程唯一一次机会已经花掉了
     }
 
     let elapsed = now_ms() - started;
@@ -320,8 +299,8 @@ fn run_wake_attempt(hwnd: HWND, started: u64) -> bool {
     let spawned = std::thread::Builder::new()
         .stack_size(1024 * 1024)
         .spawn(move || {
-            // A fresh thread needs its own apartment init; MTA like everywhere
-            // else in this process (see win::com).
+            // 新线程得自己初始化 apartment，跟本进程别处一样用 MTA
+            // （见 win::com）。
             let _com = crate::win::com::ComGuard::new();
             let _ = tx.send(wake_body(hwnd_val));
         });
@@ -345,11 +324,10 @@ fn run_wake_attempt(hwnd: HWND, started: u64) -> bool {
     }
 }
 
-/// The wake body, executed on its own thread. Every step is permitted to fail;
-/// a failure only ever means "no wake happened".
+/// wake 的主体，跑在自己的线程上。每一步都允许失败，失败只意味着“没唤醒成功”。
 fn wake_body(hwnd: isize) -> bool {
     let mut did = wake_provider(hwnd);
-    // Opt-in hosted-CLR managed wake. MEASURED INERT — see managed_wake.
+    // 可选的托管 CLR wake。实测没用——见 managed_wake。
     if std::env::var("SKY_WAKE_MANAGED").map(|v| v == "1").unwrap_or(false) {
         if let Ok(dll) = std::env::var("SKY_WAKE_DLL") {
             did |= managed_wake::run(&dll, hwnd);
@@ -358,26 +336,22 @@ fn wake_body(hwnd: isize) -> bool {
     did
 }
 
-/// Host the .NET Framework CLR in-process and run a `System.Windows.Automation`
-/// walk from the default AppDomain (opt-in: `SKY_WAKE_MANAGED=1` plus
-/// `SKY_WAKE_DLL=<path to ManagedWake.dll>`).
+/// 在进程内托管 .NET Framework CLR，从默认 AppDomain 里跑一遍
+/// `System.Windows.Automation` 走树（要手动开：`SKY_WAKE_MANAGED=1` 加
+/// `SKY_WAKE_DLL=<ManagedWake.dll 的路径>`）。
 ///
-/// MEASURED INERT — kept only so a future waker has somewhere to live without
-/// anyone re-deriving the hosting. `_probe\clr-wake` proves, with the CLR chain
-/// returning S_OK at every step (`CLRCreateInstance`, `GetRuntime`,
-/// `GetVersionString = "v4.0.30319"`, `GetInterface`, `Start`,
-/// `ExecuteInDefaultAppDomain`), that the managed stack itself returns the
-/// stub: it walks Paint to 4 nodes and Chrome to 4 nodes against the reference
-/// helper's 181 and 1438 measured in the same minute. A standalone real .NET
-/// process gets the same 4 nodes (MTA, STA, a 4.3 s settle loop, RawView *and*
-/// ControlView walkers, `FindAll(Subtree)` and root `FindAll(Descendants)`),
-/// so the 2-4 node stub is not a hosting artefact and no amount of CLR hosting
-/// — here or in a helper process — can turn it into a tree. The premise that
-/// "the managed stack gets full trees from a fresh process" does not reproduce.
+/// 实测没用。留着只是给以后的 waker 一个落脚点，省得再从头推一遍托管流程。
+/// `_probe\clr-wake` 里 CLR 那条链每一步都返回 S_OK（`CLRCreateInstance`、
+/// `GetRuntime`、`GetVersionString = "v4.0.30319"`、`GetInterface`、`Start`、
+/// `ExecuteInDefaultAppDomain`），可托管栈拿回来的还是桩：画图 4 个节点、Chrome
+/// 4 个节点，而同一分钟里原版客户端是 181 和 1438。单独跑一个真 .NET 进程也是
+/// 4 个（MTA、STA、4.3 s 的 settle 循环、RawView 和 ControlView 两种 walker、
+/// `FindAll(Subtree)` 和从 root `FindAll(Descendants)` 都试过），所以 2-4 个节点
+/// 的桩不是托管方式造成的，托管 CLR 再怎么折腾——在这里还是在单独的 helper 进程
+/// 里——都变不出树。“托管栈从新进程能拿到整棵树”这个前提复现不出来。
 ///
-/// GUIDs and vtable slots are the Microsoft MIDL values, verified working by
-/// that probe run. `GetVersionString` doubles as a layout self-check, so a
-/// wrong vtable can never send us into an arbitrary slot.
+/// GUID 和 vtable 槽位用的是微软 MIDL 里的值，那次 probe 跑通了验证。
+/// `GetVersionString` 顺便当布局自检，槽位不对就不往下走，不会失手调到别的槽里。
 mod managed_wake {
     use std::ffi::c_void;
     use windows::core::GUID;
@@ -415,8 +389,8 @@ mod managed_wake {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Returns true only if the managed walk completed and saw more than the
-    /// stub. It merely gates a re-walk; it is never an error to the caller.
+    /// 只有托管走树跑完、而且看到的比桩多才返回 true。它只决定要不要再走一遍，
+    /// 对调用方永远不算错。
     pub fn run(dll: &str, hwnd: isize) -> bool {
         unsafe {
             let name = wide("mscoree.dll");
@@ -439,7 +413,7 @@ mod managed_wake {
                 return false;
             }
 
-            // ICLRMetaHost::GetRuntime — slot 3.
+            // ICLRMetaHost::GetRuntime，槽位 3。
             let get_runtime: FnGetRuntime = std::mem::transmute(vtable(meta, 3));
             let ver = wide("v4.0.30319");
             let mut info: *mut c_void = std::ptr::null_mut();
@@ -449,9 +423,9 @@ mod managed_wake {
                 return false;
             }
 
-            // Layout self-check: ICLRRuntimeInfo::GetVersionString is slot 3.
-            // If this is not the MIDL layout we bail rather than call
-            // GetInterface through a wrong slot.
+            // 布局自检：ICLRRuntimeInfo::GetVersionString 在槽位 3。
+            // 版本串不对就说明不是 MIDL 那套布局，直接退出，别拿错槽位去调
+            // GetInterface。
             let get_version: FnGetVersionString = std::mem::transmute(vtable(info, 3));
             let mut buf = [0u16; 64];
             let mut cch = 64u32;
@@ -463,7 +437,7 @@ mod managed_wake {
                 return false;
             }
 
-            // ICLRRuntimeInfo::GetInterface — slot 9 (NOT 4).
+            // ICLRRuntimeInfo::GetInterface，槽位 9，不是 4。
             let get_iface: FnGetInterface = std::mem::transmute(vtable(info, 9));
             let mut host: *mut c_void = std::ptr::null_mut();
             if get_iface(info, &CLSID_CLR_RUNTIME_HOST, &IID_ICLR_RUNTIME_HOST, &mut host) != 0
@@ -472,14 +446,14 @@ mod managed_wake {
                 return false;
             }
 
-            // ICLRRuntimeHost::Start — slot 3 (NOT 4).
+            // ICLRRuntimeHost::Start，槽位 3，不是 4。
             let start: FnStart = std::mem::transmute(vtable(host, 3));
             if start(host) != 0 {
                 return false;
             }
 
-            // ICLRRuntimeHost::ExecuteInDefaultAppDomain — slot 11 (slot 10 is
-            // ExecuteApplication).
+            // ICLRRuntimeHost::ExecuteInDefaultAppDomain，槽位 11（槽位 10 是
+            // ExecuteApplication）。
             let exec: FnExec = std::mem::transmute(vtable(host, 11));
             let asm = wide(dll);
             let cls = wide("ManagedWake");
@@ -492,10 +466,9 @@ mod managed_wake {
     }
 }
 
-/// Subscribe the per-hwnd structure-changed event advice. Returns whether the
-/// advice was installed. Measured: this alone does NOT wake the provider
-/// (zero AdviseEventAdded on the wire), but it is the cheapest thing to keep
-/// trying and it is the shape the reference helper's connections have.
+/// 给这个 hwnd 挂上 structure-changed 事件 advise，返回有没有挂上。实测：光挂
+/// 这个唤不醒 provider（实际通信里 AdviseEventAdded 一次都没出现），但它是开销最小的
+/// 尝试，而且原版客户端的连接就是这个形状。
 fn wake_provider(hwnd_isize: isize) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -508,7 +481,7 @@ fn wake_provider(hwnd_isize: isize) -> bool {
         .map(|g| g.0.contains(&hwnd_isize))
         .unwrap_or(false);
     if already_waked {
-        return true; // already subscribed for this window
+        return true; // 这个窗口已经挂过了
     }
     let hwnd = HWND(hwnd_isize as *mut std::ffi::c_void);
     unsafe {
@@ -523,12 +496,10 @@ fn wake_provider(hwnd_isize: isize) -> bool {
         let Ok(root) = uia.ElementFromHandle(hwnd) else {
             return false;
         };
-        // AutomationFocusChangedEvent (20005) advice — the event the
-        // original's providers are demonstrably advised with (ETW:
-        // AdviseEventAdded(20005) x360). Process-wide focus advice is the
-        // only shape the COM client API offers; it is opt-in via
-        // SKY_WAKE_FOCUS=1 while we verify it cannot regress other
-        // Chromium windows' cached trees on this connection.
+        // 挂 AutomationFocusChangedEvent（20005）的 advise。原版那边的 provider
+        // 就是挂着这个（ETW 里 AdviseEventAdded(20005) 出现 360 次）。COM 客户端
+        // API 只给进程级的焦点 advise 这一种写法；先用 SKY_WAKE_FOCUS=1 手动开，
+        // 同时验证它不会把这条连接上其他 Chromium 窗口的缓存树搞坏。
         if std::env::var("SKY_WAKE_FOCUS").is_ok() {
             if let Ok(mut g) = FOCUS_KEEP.get_or_init(|| Mutex::new(None)).lock() {
                 if g.is_none() {
@@ -546,8 +517,8 @@ fn wake_provider(hwnd_isize: isize) -> bool {
                     g.0.insert(hwnd_isize);
                     g.1.push(Keepalive(handler));
                 }
-                // Let the event negotiation run: pump this thread's messages
-                // briefly (the original's event thread always pumps).
+                // 让事件协商跑起来：先泵一会儿这个线程的消息（原版的事件线程
+                // 一直在泵）。
                 pump_messages(60);
                 true
             }
@@ -559,10 +530,9 @@ fn wake_provider(hwnd_isize: isize) -> bool {
     }
 }
 
-/// Dispatch and drop this thread's pending messages for up to `ms`
-/// milliseconds. UIA core completes parts of the client event registration
-/// through the subscribing thread's message queue; without pumping, provider
-/// advises stall (measured: AdviseEventAdded never fires).
+/// 把本线程待处理的消息派发掉，最多泵 `ms` 毫秒。UIA 核心有一部分客户端事件
+/// 注册要靠订阅线程的消息队列才走得完；不泵，provider 那边的 advise 就卡住
+/// （实测：AdviseEventAdded 一次都不触发）。
 fn pump_messages(ms: u64) {
     let t0 = now_ms();
     while (now_ms() - t0) < ms {
@@ -579,12 +549,10 @@ fn pump_messages(ms: u64) {
     }
 }
 
-/// The wake trigger is purely "the first walk came back looking like the stub"
-/// (see `STUB_MAX`). It is deliberately NOT gated on the window class: the
-/// stub is not a Chromium peculiarity — Paint is UWP (`MSPaintApp`) and walks
-/// 2 nodes exactly like Chrome's `Chrome_WidgetWin_1`, so a class-based gate
-/// silently leaves every non-Chromium stubbed window unwaaked while paying the
-/// cost on healthy Chromium windows that never needed it.
+/// 触发 wake 只看一条：第一次走树的结果像桩（见 `STUB_MAX`）。故意不按窗口类
+/// 判断。桩不是 Chromium 独有的——画图是 UWP（`MSPaintApp`），照样只走 2 个
+/// 节点，跟 Chrome 的 `Chrome_WidgetWin_1` 一样。按类名筛的话，所有非 Chromium
+/// 的桩窗口会被悄悄漏掉不唤醒，却在那些本来没事的 Chromium 窗口上白费时间。
 struct Snapshot {
     elements: Vec<ElementRecord>,
     lines: Vec<String>,
@@ -592,14 +560,13 @@ struct Snapshot {
     title: String,
 }
 
-/// Build the accessibility tree for `hwnd`. `app_name` renders the header
-/// line (`Window: "{title}", App: {app_name}.`).
+/// 给 `hwnd` 建无障碍树。`app_name` 只用来填 header 那行
+/// （`Window: "{title}", App: {app_name}.`）。
 ///
-/// Deliberately uses the non-cached walker/property calls: UIA's
-/// BuildCache variants ask the provider to answer live and yield an empty
-/// subtree for hung/suspended providers, while the plain calls let the UIA
-/// core replay its last known snapshot — which is what the original does
-/// (it renders full trees even for suspended Chromium processes).
+/// 故意用不带缓存的 walker 和属性调用。UIA 的 BuildCache 系列会要求 provider
+/// 当场应答，碰到挂起或卡住的 provider 只给一棵空子树；普通调用则让 UIA 核心
+/// 重放它最后一次知道的快照——原版就是这么干的（连挂起的 Chromium 进程它也能
+/// 渲染出整棵树）。
 pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
     let uia = UIAutomation::new().map_err(|e| {
         dbg_log(&format!("[init-fail] {e}"));
@@ -616,9 +583,9 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
         .map_err(|e| format!("walker: {e}"))?;
 
     let started = now_ms();
-    // Window frame in screen px plus its DPI factor: element rects are screen
-    // physical, but the tree is rendered for a model measuring on the logical
-    // window screenshot, so each row carries window-relative logical bounds.
+    // 窗口在屏幕上的位置（屏幕 px）加 DPI 系数。元素 rect 是屏幕物理像素，
+    // 但树是给一个按逻辑像素量窗口截图的模型看的，所以每行带的是窗口相对的
+    // 逻辑坐标。
     let (win_origin, win_scale) = {
         let origin = root
             .get_bounding_rectangle()
@@ -630,16 +597,14 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
     };
     let mut snapshot = walk_snapshot(&walker, &root, started, win_origin, win_scale);
 
-    // Wake path: entered ONLY when the first walk came back looking like the
-    // synthesized stub. A window that walked normally returns from build_tree
-    // without touching any of this — no advise, no pump, no thread, no added
-    // latency. (Previously wake_provider ran unconditionally *before* the first
-    // walk, so every fresh window paid a 60 ms message pump.)
+    // wake 路径只在第一次走树的结果像“合成桩”时才进。正常走通的窗口直接从
+    // build_tree 返回，这里一点都不碰：没有 advise、不泵消息、不起线程、不多等
+    // 一分。以前 wake_provider 是不管不顾在第一次走树*之前*跑的，结果每个新窗口
+    // 都白付 60 ms 的消息泵。
     //
-    // Order matters: the integrity check is a token query we can answer in
-    // microseconds and it explains the stub outright, so it runs first and
-    // short-circuits a wake attempt that provably cannot succeed. The wake
-    // itself is opt-in (`SKY_WAKE=1`) — see `wake_enabled`.
+    // 顺序有讲究：完整性检查就是一次 token 查询，几微秒就能答，而且它直接把桩
+    // 解释清楚了，所以放最前面，先把明知不会成的 wake 挡掉。wake 本身还要手动开
+    // （`SKY_WAKE=1`），见 `wake_enabled`。
     if snapshot.elements.len() <= STUB_MAX {
         if below_medium_il() {
             warn_low_il_once();
@@ -656,20 +621,18 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
                 integrity_rid()
             ));
         }
-        // An explicit SKY_WAKE=1 still runs the wake at Low IL: the diagnosis
-        // is ours to report, not to hide an experiment behind.
+        // Low IL 下显式给了 SKY_WAKE=1 照样跑：诊断归诊断，不能拿它当借口把
+        // 实验藏起来。
         if wake_enabled() && run_wake_attempt(hwnd, started) {
             let next = walk_snapshot(&walker, &root, started, win_origin, win_scale);
-            // Growth-stable settle: after a wake that actually landed, keep
-            // re-walking until the tree is past the stub and stops growing.
-            // OPT-IN (SKY_WAKE_RETRY=1), still bounded by TREE_BUDGET_MS.
+            // 长到不再变为止：wake 真成功之后，反复重走，直到树过了桩、并且
+            // 不再变大。要手动开（SKY_WAKE_RETRY=1），仍然受 TREE_BUDGET_MS 约束。
             //
-            // It stays opt-in because no wake on this machine has been measured to
-            // land: with the retry loop Chrome's first request was 4 lines/3 nodes
-            // in 1653 ms, without it the same 4 lines/3 nodes in 89 ms, while the
-            // reference helper served 1438 nodes in ~530 ms in the same run. The
-            // loop is the right shape for the day a wake does land; it must not
-            // cost 1.5 s per request while unproven.
+            // 之所以留着手动开：这台机器上没测到过 wake 成功。开着重试循环，
+            // Chrome 第一个请求是 4 行/3 个节点、耗时 1653 ms；关掉还是 4 行/3 个
+            // 节点，只要 89 ms。而同一次运行里原版客户端是 1438 个节点、约 530 ms。
+            // 等哪天 wake 真成了，这个循环形状是对的；没验证之前不能每个请求都
+            // 花掉 1.5 s。
             if next.elements.len() > snapshot.elements.len()
                 && std::env::var("SKY_WAKE_RETRY").map(|v| v == "1").unwrap_or(false)
             {
@@ -684,7 +647,7 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
                     let n = grown.elements.len();
                     snapshot = grown;
                     if n > STUB_MAX && n == last {
-                        break; // grown and stable
+                        break; // 长起来了而且稳住了
                     }
                     if n > last {
                         last = n;
@@ -705,7 +668,7 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
     out_lines.append(&mut lines);
     let tree = out_lines.join("\n");
 
-    // Focused element: rendered as its tree line when inside this subtree.
+    // 焦点元素：在这棵子树里，就把它在树里的那一行回显出去。
     let focused_element = uia.get_focused_element().ok().and_then(|f| {
         let fid = f.get_runtime_id().ok()?;
         snapshot
@@ -717,7 +680,7 @@ pub fn build_tree(hwnd: HWND, app_name: &str) -> Result<BuiltTree, String> {
                     .map(|id| id == fid)
                     .unwrap_or(false)
             })
-    }).and_then(|i| out_lines.get(i + 1).cloned()); // +1: skip header line
+    }).and_then(|i| out_lines.get(i + 1).cloned()); // +1 是跳过 header 行
 
     let built = BuiltTree {
         tree,
@@ -798,7 +761,7 @@ fn walk(
     let offscreen = node.is_offscreen().unwrap_or(false);
     let enabled = node.is_enabled().unwrap_or(true);
 
-    // ValuePattern shape: value string + settable marker.
+    // ValuePattern 的两样东西：值字符串和能不能改的标记。
     let value = node
         .get_pattern::<UIValuePattern>()
         .ok()
@@ -838,7 +801,7 @@ fn walk(
         enabled,
     });
 
-    // Render per the original's field order.
+    // 按原版的字段顺序拼。
     let mut label = format!("{}{index} {localized}", "\t".repeat(depth + 1));
     if !enabled {
         label.push_str(" (disabled)");
@@ -858,8 +821,7 @@ fn walk(
     if !automation_id.is_empty() {
         label.push_str(&format!(" ID: {automation_id}"));
     }
-    // Window-relative logical bounds: what a model measuring on the window
-    // screenshot needs for a coordinate click without guessing.
+    // 窗口相对的逻辑坐标。模型在窗口截图上量坐标、想直接点而不瞎猜，就靠这个。
     if rect.2 > 0 && rect.3 > 0 {
         let s = win_scale;
         let lx = ((rect.0 - win_origin.0) as f64 / s).round() as i32;
@@ -873,9 +835,9 @@ fn walk(
     }
     lines.push(label);
 
-    // Recurse through children (disabled/offscreen subtrees included: the
-    // original renders them). No children / provider gaps surface as Err
-    // (null + S_OK) and end the sibling walk, as before.
+    // 递归走子节点，disabled/offscreen 的子树也走（原版会渲染它们）。没子节点
+    // 或者 provider 有断档时表现为 Err（null + S_OK），跟以前一样，这一层兄弟
+    // 节点的遍历就到此为止。
     let mut child = match walker.get_first_child(node) {
         Ok(c) => Some(c),
         Err(e) => {
