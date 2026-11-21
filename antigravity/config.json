@@ -1,0 +1,16 @@
+{
+  "autoApprove": [],
+  "denyApps": [
+    "Antigravity.exe",
+    "Antigravity",
+    "WindowsTerminal.exe",
+    "Microsoft.WindowsTerminal"
+  ],
+  "approvalMode": "dialog",
+  "enforceBrowserUrlPolicy": false,
+  "timeoutMs": 10000,
+  "launchTimeoutMs": 15000,
+  "turnIdleMs": 30000,
+  "idleCloseMs": 15000,
+  "locale": "zh"
+}

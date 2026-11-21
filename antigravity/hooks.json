@@ -1,0 +1,12 @@
+{
+  "computer-use-cleanup": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./scripts/stop-hook.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

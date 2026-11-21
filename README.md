@@ -66,6 +66,21 @@ npm install --omit=dev
 
 然后把仓库放到 DSH profile 能找到的位置，用 plugin manager 安装；或者把 `cordis.patch.yml` 里的两条 `insert` 合进 profile composition，`name:` 指向 `computer-use-codex2dsh`。插件标记为 `win32`。
 
+## 装进 Antigravity（`antigravity/`）
+
+`antigravity/` 目录是独立的 Antigravity 插件包（仅依赖公开包 `@modelcontextprotocol/sdk`，不依赖 DSH 私有包），默认以本机 `codex-computer-use.exe` 为后端（也可在 `antigravity/config.json` 中把 `helperPath` 指到 `engine/target/release/sky-engine.exe`）：
+
+```powershell
+Copy-Item -Recurse antigravity "$HOME\.gemini\config\plugins\computer-use"
+cd "$HOME\.gemini\config\plugins\computer-use"
+npm install --omit=dev
+```
+
+包含以下针对 Antigravity 与桌面收尾的适配：
+- **15 个 `sky__*` 工具**：在原有 14 个工具之外增加 `sky__close`，操作完成后立即发送 `end_turn` 与 `close` 收起代理光标和顶部状态条，同时在内存里保留本会话已批准的应用权限。
+- **三层自动退出保障**：`sky__close` 主动退出 + `hooks.json` 的 `Stop` 钩子（`scripts/stop-hook.mjs` 经本地命名管道在每轮对话结束时自动回收）+ `idleCloseMs`（默认 15 秒空闲自动关闭）。
+- **原生置顶审批框与自我保护**：默认拦截对 `Antigravity` 和 `WindowsTerminal` 的控制；其它应用首次访问时弹出 Windows 置顶确认框（`approvalMode: "dialog"`），本会话内记住选择。详见 [antigravity/README.md](antigravity/README.md)。
+
 ## 配置
 
 | 选项 | 默认 | 说明 |

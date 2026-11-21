@@ -1,0 +1,22 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "computer-use",
+  "displayName": "Computer Use",
+  "version": "0.2.0",
+  "description": "Windows desktop Computer Use powered by codex-computer-use: inspect apps, windows, and UIA trees, capture screenshots, and drive desktop UIs with mouse and keyboard.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "列出当前打开的 Windows 窗口并查看目标窗口截图",
+    "启动计算器并计算 128 乘以 256 的结果",
+    "打开记事本并输入一段测试文字"
+  ],
+  "repository": "https://github.com/AlexRice13/computer-use-codex2dsh",
+  "license": "MIT",
+  "keywords": [
+    "computer-use",
+    "windows",
+    "desktop",
+    "uia",
+    "codex"
+  ]
+}

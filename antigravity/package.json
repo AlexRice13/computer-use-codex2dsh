@@ -1,0 +1,14 @@
+{
+  "name": "antigravity-plugin-computer-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Antigravity Computer Use MCP server backed by codex-computer-use.exe",
+  "main": "scripts/server.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1"
+  }
+}

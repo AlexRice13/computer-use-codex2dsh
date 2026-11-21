@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codex-computer-use": {
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/server.mjs",
+        "--config",
+        "${PLUGIN_ROOT}/config.json"
+      ]
+    }
+  }
+}

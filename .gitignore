@@ -1,10 +1,13 @@
 node_modules/
 /engine/target/
+/antigravity/scripts/vendor/
+*.exe
 *.log
 *.tmp
 tmp/
 stage/
 codex-home/
 .dsh-stage.json
+.agy-stage.json
 .DS_Store
 Thumbs.db
