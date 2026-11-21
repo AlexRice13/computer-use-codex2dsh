@@ -1,15 +1,18 @@
 # computer-use-codex2dsh
 
-给 DeepSeek Harness 用的 Windows 电脑操作插件。14 个 `sky__*` 工具，底层是自己用 Rust 重写的 Sky 助手（`sky-engine`），运行时不依赖 ChatGPT 或 Codex。
+给 **DeepSeek Harness (DSH)** 和 **Google Antigravity** 用的 Windows 电脑操作插件。提供一套 `sky__*` 桌面控制工具，后端既能用仓库自带的 Rust 重写引擎（`sky-engine`），也能直接接本机 Codex/ChatGPT 自带的 `codex-computer-use.exe`，运行时不读账号数据，也不用联网。
 
-`computer-use-codex2dsh` 是一个独立的 Cordis 插件：它把 `engine/` 里的 `sky-engine` 接到 DSH 上，模型因此能看窗口、点击、打字、滚动、拖拽。引擎复刻的是 Sky `codex-computer-use.exe` 的 stdio JSON-RPC 行为。插件本身是 Node.js 写的客户端和监管进程，运行时不连 ChatGPT/Codex 的服务，不读账号数据，也不用网络。
+仓库里带两套前端入口，共用同一套 Sky stdio JSON-RPC 协议：
+
+- **仓库根目录（DSH 插件）**：独立的 Cordis 插件（`@local/dsh-computer-use-sky`），向 DSH 注册 14 个 `sky__*` 工具，接 DSH 的 `computerUse` 与审批服务。
+- **[`antigravity/`](antigravity/README.md)（Antigravity 插件）**：独立的 Antigravity 插件包（`plugin.json` + stdio MCP + `computer-use` Skill + `Stop` 钩子），只依赖公开的 `@modelcontextprotocol/sdk`，不依赖任何 DSH 私有包；提供 15 个 `sky__*` 工具（新增 `sky__close`）与三层自动退出机制，任务结束后自动收起代理光标和状态条。
 
 ## 它做什么
 
-- 向 Harness 注册 14 个 `sky__*` 工具，占住 `computerUse` 的注册位。
-- 第一次调用时把 `sky-engine` 和本地 `app-server` 桩复制到 `%LOCALAPPDATA%\dsh-computer-use\bin`，用 `--parent-pid` 启动并监管；卸载插件时把进程收干净。
-- 截图经 MCP 适配器投影成图片附件；UIA 树带元素索引和窗口相对包围盒。插件这层另外做快照新鲜度校验、遮挡判断和自我排除。
-- 截图支持 `scale` 缩放和 `region` 裁剪，省 token。在缩小或裁剪后的图上量的坐标可以直接用于点击、拖拽、滚动。同一张快照上的一串动作可以用 `sky__batch` 一次发完。
+- 让模型能枚举应用与窗口、抓窗口截图与 UIA 控件树、点击、输入、拖拽、滚动和启动桌面软件。
+- 第一次调用时把后端助手和本地 `app-server` 桩复制到 `%LOCALAPPDATA%` 下的独立 Medium 完整性目录（DSH 默认 `dsh-computer-use\bin`，Antigravity 默认 `agy-computer-use\bin`），用 `--parent-pid` 启动并监管。
+- 截图作为图片返回给模型，UIA 树带元素索引；客户端层另外做快照新鲜度校验、遮挡判断和宿主自我保护（禁止操作 DSH、Antigravity 与终端窗口自身）。
+- 用 `sky-engine` 时，截图额外支持 `scale` 缩放、`region` 裁剪，UIA 树行尾带窗口相对包围盒 `@x,y WxH`；同一张快照上的一串动作可以用 `sky__batch` 一次发完。
 
 ## 引擎
 
@@ -40,7 +43,7 @@ helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
 | 工具 | 干什么 |
 |------|------|
 | `sky__list_apps` / `sky__list_windows` / `sky__get_window` | 列应用和窗口，拿到窗口句柄 `{app, id}` |
-| `sky__get_window_state` | 一次拿到 JPEG 截图和 UIA 树。树里的元素索引只对这次快照有效。可以传 `scale`（0.1–1）出小图，`region {x,y,width,height}`（逻辑窗口坐标）只截一块。树行尾带窗口相对包围盒 `@x,y WxH` |
+| `sky__get_window_state` | 一次拿到 JPEG 截图和 UIA 树。树里的元素索引只对这次快照有效。用 `sky-engine` 后端时还可传 `scale`（0.1–1）出小图、`region {x,y,width,height}`（逻辑窗口坐标）只截一块，树行尾带窗口相对包围盒 `@x,y WxH` |
 | `sky__activate_window` | 把窗口提到前台。发任何输入之前都要先做，因为输入只进前台窗口 |
 | `sky__click` | 按元素索引点（首选），或按快照坐标点（必须带 `screenshotId`） |
 | `sky__drag` / `sky__scroll` | 按快照坐标拖、滚（必须带 `screenshotId`）。拖拽会按距离插值，到落点停一下再抬键，长距离手势不会断 |
@@ -48,15 +51,18 @@ helperPath: "C:/path/to/engine/target/release/sky-engine.exe"
 | `sky__type_text` / `sky__press_key` | 输入字面文本 / 按组合键（`Enter`、`ctrl+s` 等） |
 | `sky__set_value` / `sky__perform_secondary_action` | 按 UIA value pattern 写值 / 执行次级动作（Raise、Scroll Up/Down/Left/Right、Expand、Collapse） |
 | `sky__launch_app` | 按应用 id、AUMID、exe 路径或应用名启动应用 |
+| `sky__close`（Antigravity） | 结束当前电脑操作回合并关闭助手进程，立即收起代理光标与状态条，保留当前会话的应用授权记忆 |
 
 ## 前置要求
 
 - Windows 10/11。
-- DSH 0.2.2-rc.1。peer 依赖 `@deepseek-ai/dsh-system-prompt` 和 `dsh-tools` 是 `^0.2.2-rc.1`，cordis 是 `~4.1.0`；0.2.1 及更早会被 bundle 的版本校验挡住。
-- Node.js。要 `node.exe` 来跑本地 app-server 桩，可以用 `nodePath` 指定。
-- 用自带引擎时不用装 OpenAI Codex 或 ChatGPT 桌面版。
+- Node.js（`>= 20`，同时用 `node.exe` 跑本地 `app-server` 桩，可用 `nodePath` 指定）。
+- 按宿主二选一：
+  - **DeepSeek Harness**：要求 DSH `0.2.2-rc.1`（peer 依赖 `@deepseek-ai/dsh-system-prompt` 与 `dsh-tools` 为 `^0.2.2-rc.1`，cordis 为 `~4.1.0`）。
+  - **Google Antigravity**：使用 `antigravity/` 子目录，仅依赖公开包 `@modelcontextprotocol/sdk`，不需要安装 DSH。
+- 后端二选一：自己编译仓库里的 `engine/`（`sky-engine.exe`，无需装 Codex/ChatGPT），或直接使用本机 Codex/ChatGPT 桌面版自带的 `codex-computer-use.exe`。
 
-## 安装
+## 安装到 DeepSeek Harness
 
 `plugin_manager` 装本地目录用的是 `link:` 协议，不会装包的 `dependencies`。先把运行时依赖装进包里：
 
@@ -66,7 +72,7 @@ npm install --omit=dev
 
 然后把仓库放到 DSH profile 能找到的位置，用 plugin manager 安装；或者把 `cordis.patch.yml` 里的两条 `insert` 合进 profile composition，`name:` 指向 `computer-use-codex2dsh`。插件标记为 `win32`。
 
-## 装进 Antigravity（`antigravity/`）
+## 安装到 Antigravity（`antigravity/`）
 
 `antigravity/` 目录是独立的 Antigravity 插件包（仅依赖公开包 `@modelcontextprotocol/sdk`，不依赖 DSH 私有包），默认以本机 `codex-computer-use.exe` 为后端（也可在 `antigravity/config.json` 中把 `helperPath` 指到 `engine/target/release/sky-engine.exe`）：
 
@@ -95,8 +101,8 @@ npm install --omit=dev
 
 ## 安全模型
 
-- 逐应用审批，默认拒绝：助手第一次碰某个应用会发 `approvalRequest`，插件转给 Harness 的审批服务问用户。没有审批服务，或者用户拒绝，就不放行。`allowed-once` 只在一个 agent 会话里记住。
-- Harness 自己不能被操作：所有输入类工具（点击、输入、按键、激活等）和审批层都会把指向 Harness 的目标挡掉，`autoApprove` 也解不开。
+- 逐应用审批，默认拒绝：助手第一次碰某个应用会发 `approvalRequest`，DSH 版转给 Harness 审批服务，Antigravity 版弹出原生 Windows 置顶确认框（或走 MCP elicitation）。用户同意后仅在当前会话内记住，拒绝则不放行。
+- 宿主自身不能被操作：所有输入类工具和审批层都会拦截指向 DSH 或 Antigravity（以及 Antigravity 版默认拦截的 `WindowsTerminal`）的目标，`autoApprove` 也解不开。
 - 物理 Esc：只认真实按键。注入的 `SendInput`（包括插件自己发的 `press_key Escape`）带 `LLKHF_INJECTED`/`SKY_ESC` 标记，不会触发中断。助手以 130 退出并写中断标记后，本回合剩下的调用都会直接报“用户已停止电脑操作”；回合往前走或者标记被清掉就恢复。
 - 坐标守卫：坐标输入必须带该窗口最新快照的 `screenshotId`。快照时被别的窗口盖住的点直接拒绝；目标应用自己的小菜单不算遮挡。输入一送达，旧快照的坐标就作废。
 - 这些护栏只是护栏，桌面操作请在能人工盯着的情况下用。
@@ -116,4 +122,4 @@ npm install --omit=dev
 
 ## 免责声明
 
-非官方项目，和 OpenAI、DeepSeek 都没有关系。`engine/` 是本仓库自己写的；原版 `codex-computer-use.exe`（如果你选择用它）归上游，请遵守它的许可和服务条款。
+非官方项目，和 OpenAI、DeepSeek、Google 都没有关系。`engine/` 是本仓库自己写的；原版 `codex-computer-use.exe`（如果你选择用它）归上游，请遵守它的许可和服务条款。
